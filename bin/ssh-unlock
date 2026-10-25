@@ -1,0 +1,14 @@
+#!/bin/sh
+# 幂等地把 ssh 私钥载入常驻 ssh-agent（供 ssh/scp/git 免口令使用）。
+# 不落盘任何口令：凭据只从当前环境的 $SSH_PASS 取。
+SOCK="$HOME/.ssh/agent.sock"
+KEY="$HOME/.ssh/Keys/id_ed25519"
+
+[ -S "$SOCK" ] || exit 0                 # agent 未启动（systemd 用户单元负责）
+SSH_AUTH_SOCK="$SOCK" ssh-add -l >/dev/null 2>&1 && exit 0
+[ -n "$SSH_PASS" ] || exit 0             # 没有口令可用就安静退出，ssh 会回退到 askpass
+
+SSH_AUTH_SOCK="$SOCK" \
+SSH_ASKPASS="$HOME/.ssh/askpass.sh" \
+SSH_ASKPASS_REQUIRE=force \
+ssh-add "$KEY" </dev/null >/dev/null 2>&1

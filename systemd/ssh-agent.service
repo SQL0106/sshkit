@@ -1,0 +1,12 @@
+[Unit]
+Description=SSH authentication agent (persistent socket)
+Documentation=man:ssh-agent(1)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh-agent -D -a %h/.ssh/agent.sock
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

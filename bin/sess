@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""sess —— 给 agent 用的常驻远端 shell 会话。
+
+为什么：每次 `ssh host cmd` 都要付一次「远端起 shell 进程」的钱。Linux 上那是 15ms
+（已有 ControlMaster，握手都省了），Windows 上是 380ms（pwsh 启动）。常驻会话把
+这笔钱只付一次，之后每条命令 ≈ 20ms，而且 cd / 环境变量 / 函数定义跨命令保留。
+
+用法：
+    sess run <host> '<命令>'     # 在常驻会话里执行（自动启动会话）
+    sess run --new <host> '<命令>'  # 先重建会话再执行
+    sess list                    # 列出会话
+    sess stop [<host>]           # 关闭会话（省略=全部）
+    sess kind <host>             # 查看远端类型（posix / windows）
+
+协议：本地 keeper（后台进程）持有 `ssh -T`，远端 loop 从 stdin 按行读
+`<token>:<base64 脚本>`，执行后在输出末尾写 `\\n__END__<token>:<退出码>\\n`。
+脚本一律 base64，远端本地都不做引号解析；输出的分帧全靠随机 token 哨兵。
+"""
+import base64
+import errno
+import fcntl
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(HOME, ".cache", "sess")
+IDLE_TIMEOUT = 1800        # 空闲 30 分钟自动回收
+READY_TIMEOUT = 60         # 远端 shell 就绪超时
+TRAILER = b"\x00SESS_RC:"
+
+# ---------------------------------------------------------------- 远端 loop
+
+POSIX_LOOP = (
+    'while IFS= read -r __sess_line; do '
+    '__sess_tok=${__sess_line%%:*}; __sess_b64=${__sess_line#*:}; '
+    '__sess_src=$(printf "%s" "$__sess_b64" | base64 -d); '
+    'eval "$__sess_src" </dev/null; __sess_rc=$?; '
+    'printf "\\n__END__%s:%d\\n" "$__sess_tok" "$__sess_rc"; '
+    'printf "\\n__END__%s:%d\\n" "$__sess_tok" "$__sess_rc" >&2; '
+    'done'
+)
+
+PWSH_LOOP = r'''
+$ProgressPreference = "SilentlyContinue"
+try { $PSStyle.OutputRendering = "PlainText" } catch {}
+[Console]::Out.WriteLine("__READY__")
+[Console]::Out.Flush()
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    if ($line.Length -eq 0) { continue }
+    $i = $line.IndexOf(":")
+    $tok = $line.Substring(0, $i)
+    $b64 = $line.Substring($i + 1)
+    $code = 0
+    $global:__sessOk = $true
+    $global:__sessCode = 0
+    $global:LASTEXITCODE = 0
+    try {
+        $src = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+        # 关键：$? 必须在「用户代码之后、同一 scriptblock 内」取值，
+        # 否则点源返回后 $? 只反映 dot-source 本身（恒为 True）。
+        $src = $src + "`n" + '$global:__sessOk = $?; $global:__sessCode = $LASTEXITCODE'
+        . ([scriptblock]::Create($src))
+        if (-not $global:__sessOk) {
+            if ($global:__sessCode -is [int] -and $global:__sessCode -ne 0) { $code = $global:__sessCode } else { $code = 1 }
+        }
+    } catch {
+        [Console]::Error.WriteLine($_.ToString())
+        $code = 1
+    }
+    [Console]::Out.Write("`n__END__" + $tok + ":" + $code + "`n")
+    [Console]::Out.Flush()
+    # stderr 也要发一份哨兵：两条管道到达顺序不确定，keeper 靠双哨兵对齐
+    [Console]::Error.Write("`n__END__" + $tok + ":" + $code + "`n")
+    [Console]::Error.Flush()
+}
+'''
+
+
+PROTO = ".v3"   # 协议版本：升级帧格式时改这里，旧 keeper 的 socket 自然失效
+
+
+def paths(host):
+    return (os.path.join(CACHE, host + PROTO + ".sock"), os.path.join(CACHE, host + PROTO + ".pid"),
+            os.path.join(CACHE, host + PROTO + ".kind"), os.path.join(CACHE, host + PROTO + ".log"))
+
+
+def ensure_cache():
+    os.makedirs(CACHE, exist_ok=True)
+    os.chmod(CACHE, 0o700)
+
+
+# ---------------------------------------------------------------- 探测
+
+def detect_kind(host):
+    """远端是 POSIX shell 还是 PowerShell。探测成功才缓存。
+
+    不能把「连不上」当成 windows：那样会缓存一个错误结论，之后一直用 pwsh
+    协议去戳一台 Linux 机。所以探测失败就直接报错、不落盘。
+    """
+    _, _, kind_file, _ = paths(host)
+    if os.path.exists(kind_file):
+        return open(kind_file).read().strip() or "posix"
+
+    def probe(cmd):
+        return subprocess.run(["ssh", "-T", "-o", "ConnectTimeout=20", host, cmd],
+                              capture_output=True, timeout=90)
+
+    try:
+        r = probe("uname -s")
+    except Exception as e:
+        raise SystemExit("sess: 探测 %s 失败（%r）" % (host, e))
+    out = r.stdout
+    if r.returncode == 0 and any(x in out for x in (b"Linux", b"Darwin", b"BSD")):
+        kind = "posix"
+    elif any(x in out for x in (b"MINGW", b"MSYS", b"CYGWIN")):
+        kind = "windows"
+    else:
+        # 再探一次 PowerShell 特征；连 echo 都跑不动说明是连接层问题
+        try:
+            r2 = probe('"$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"')
+        except Exception as e:
+            raise SystemExit("sess: 探测 %s 失败（%r）" % (host, e))
+        if r2.returncode == 0 and r2.stdout.strip()[:1].isdigit():
+            kind = "windows"
+        else:
+            err = (r.stderr or r2.stderr or b"").decode("utf-8", "replace").strip()
+            raise SystemExit("sess: 无法判断 %s 的类型（ssh rc=%d）：%s"
+                             % (host, r.returncode, err.splitlines()[-1] if err else "无输出"))
+    with open(kind_file, "w") as f:
+        f.write(kind + "\n")
+    return kind
+
+
+def shquote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def ssh_command(host, kind):
+    if kind == "posix":
+        # 关键：远端登录 shell 可能是 zsh/sh，一律强制落 bash（LLM 的知识默认是 bash）
+        loop = shquote(POSIX_LOOP)
+        boot = ("if command -v bash >/dev/null 2>&1; then exec bash --noprofile --norc -c %s; "
+                "else exec sh -c %s; fi" % (loop, loop))
+        return ["ssh", "-T", host, boot]
+    blob = base64.b64encode(PWSH_LOOP.encode()).decode()
+    return ["ssh", "-T", host,
+            "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString("
+            "[Convert]::FromBase64String('" + blob + "'))))"]
+
+
+# ---------------------------------------------------------------- keeper
+
+def send_frame(conn, kind, data):
+    conn.sendall(kind + struct.pack(">I", len(data)) + data)
+
+
+class Keeper:
+    def __init__(self, host, kind):
+        self.host = host
+        self.kind = kind
+        self.lock = threading.Lock()
+        self.buflock = threading.Lock()
+        self.proc = None
+        self.q = None            # 当前命令的 (kind, bytes) 队列
+        self.buf = b""
+        self.dead = False
+        self.last_used = time.time()
+        self.kill_now = False
+
+    def log(self, msg):
+        try:
+            with open(paths(self.host)[3], "a") as f:
+                f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+        except Exception:
+            pass
+
+    def spawn(self):
+        self.proc = subprocess.Popen(ssh_command(self.host, self.kind),
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, bufsize=0)
+        self.reset()
+        # POSIX 的 bash 立刻就在读 stdin，没有 READY 握手；pwsh 要等它打印 __READY__
+        ready = [self.kind == "posix"]
+        ev = threading.Event()
+        if ready[0]:
+            ev.set()
+
+        def out_reader():
+            head = b""
+            while True:
+                chunk = self.proc.stdout.read(4096)
+                if not chunk:
+                    break
+                if not ready[0]:
+                    head += chunk
+                    if b"__READY__" in head:
+                        ready[0] = True
+                        ev.set()
+                        chunk = head.split(b"__READY__", 1)[1].lstrip(b"\r\n")
+                        head = b""
+                        if not chunk:
+                            continue
+                    else:
+                        continue
+                self.feed("out", chunk)
+            self.dead = True
+            ready[0] = True
+            ev.set()
+            q = self.q
+            if q is not None:
+                for stream, buf in self.bufs.items():
+                    if buf:
+                        q.put((stream, buf))
+                self.reset()
+                q.put(("end", -1))
+
+        def err_reader():
+            while True:
+                chunk = self.proc.stderr.read(4096)
+                if not chunk:
+                    break
+                self.feed("err", chunk)
+
+        threading.Thread(target=out_reader, daemon=True).start()
+        threading.Thread(target=err_reader, daemon=True).start()
+
+        if self.kind == "windows":
+            if not ev.wait(READY_TIMEOUT) or not ready[0]:
+                raise RuntimeError("远端会话未就绪: %s" % self.host)
+        else:
+            # POSIX：确认 ssh 没有立刻失败（bash 已在读 stdin）
+            time.sleep(0.15)
+            if self.proc.poll() is not None:
+                raise RuntimeError("远端会话立刻退出: %s" % self.host)
+
+    def reset(self):
+        with self.buflock:
+            self.bufs = {"out": b"", "err": b""}
+            self.pending = {"out", "err"}
+            self.out_done = False
+            self.rc = 0
+
+    def feed(self, stream, chunk):
+        """按流分别找哨兵：远端在 stdout/stderr 各写一份，两路都到齐才算命令结束。
+
+        这样不依赖两条管道的到达顺序（早前 stderr 偶发丢就是因为顺序不定）。
+        """
+        with self.buflock:
+            q = self.q
+            if q is None:
+                return
+            buf = self.bufs[stream] + chunk
+            marker = b"__END__" + self.tok + b":"
+            idx = buf.find(marker)
+            if idx < 0:
+                keep = len(marker) - 1
+                if len(buf) > keep:
+                    q.put((stream, buf[:-keep]))
+                    buf = buf[-keep:]
+                self.bufs[stream] = buf
+                return
+            out = buf[:idx]
+            # 远端发的是 "\n__END__tok:rc\n"，把哨兵前那一个换行去掉，保证输出字节不变形
+            if out.endswith(b"\r\n"):
+                out = out[:-2]
+            elif out.endswith(b"\n"):
+                out = out[:-1]
+            if out:
+                q.put((stream, out))
+            rest = buf[idx + len(marker):]
+            nl = rest.find(b"\n")
+            if nl < 0:
+                self.bufs[stream] = buf[idx:]
+                return
+            code_s = rest[:nl].strip()
+            self.bufs[stream] = rest[nl + 1:]
+            try:
+                code = int(code_s)
+            except ValueError:
+                code = 1
+            if stream == "out":
+                self.rc = code
+                self.out_done = True
+            self.pending.discard(stream)
+            if not self.pending:
+                q.put(("end", self.rc))
+
+    def run(self, script, conn):
+        with self.lock:
+            if self.dead:
+                self.spawn()
+            self.last_used = time.time()
+            for attempt in (0, 1):
+                if self.dead:
+                    try:
+                        self.spawn()
+                    except Exception as e:
+                        self.log("spawn failed: %r" % e)
+                        self.dead = True
+                self.tok = os.urandom(8).hex().encode()
+                self.q = q = _Queue()
+                self.reset()
+                payload = self.tok + b":" + base64.b64encode(script.encode()) + b"\n"
+                try:
+                    self.proc.stdin.write(payload)
+                    self.proc.stdin.flush()
+                    break
+                except Exception as e:
+                    # 远端 shell 已死（退出码被吞/被杀）：重建一次再试，别把错误丢给调用方
+                    self.log("write failed (attempt %d): %r -> respawn" % (attempt, e))
+                    self.dead = True
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+            else:
+                self.q = None
+                send_frame(conn, b"R", struct.pack(">i", 1))
+                return
+            code = 1
+            while True:
+                if self.out_done:
+                    # stdout 已收哨兵、stderr 还没到：给 stderr 一点宽限（用户代码
+                    # 若做过 exec 2>&1 之类重定向，err 哨兵可能永远不来）
+                    try:
+                        kind, data = q.get(timeout=0.3)
+                    except Exception:
+                        break
+                else:
+                    kind, data = q.get()
+                if kind == "end":
+                    code = data
+                    break
+                try:
+                    send_frame(conn, b"O" if kind == "out" else b"E", data)
+                except OSError:
+                    # 客户端断了：远端可能还在跑，杀掉会话避免协议错位
+                    self.log("client gone -> kill session")
+                    self.dead = True
+                    self.q = None
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+                    return
+            self.q = None
+            self.last_used = time.time()
+            try:
+                send_frame(conn, b"R", struct.pack(">i", code))
+            except OSError:
+                pass
+
+    def serve(self):
+        sock_path, pid_file = paths(self.host)[0], paths(self.host)[1]
+        # 互斥：已有活着的 keeper 就绝不抢它的 socket 文件（否则两个 keeper
+        # 会轮流吃客户端，表现为「cd / 环境变量莫名其妙丢了」）
+        if live_keeper(sock_path, pid_file):
+            self.log("another keeper alive -> exit")
+            return
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv = srv
+        srv.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+        srv.listen(8)
+        # 1s 轮询：Linux 上「别的线程 close 监听 socket」不会唤醒阻塞中的 accept()，
+        # 所以靠短超时来感知 stop / 空闲，不能等 30s
+        srv.settimeout(0.25)
+        with open(paths(self.host)[1], "w") as f:
+            f.write(str(os.getpid()))
+        try:
+            with open(os.path.join(CACHE, self.host + ".sig"), "w") as f:
+                f.write(src_sig())
+        except OSError:
+            pass
+        self.log("keeper up kind=%s" % self.kind)
+        try:
+            self.spawn()
+        except Exception as e:
+            self.log("spawn failed: %r" % e)
+            raise
+        while not self.kill_now:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                if self.kill_now:
+                    break
+                if time.time() - self.last_used > IDLE_TIMEOUT:
+                    self.log("idle timeout")
+                    break
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+        self.shutdown()
+
+    def handle(self, conn):
+        try:
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+                if len(data) > 4 << 20:
+                    return
+            script = data[:-1].decode("utf-8", "replace")
+            if script == "__STOP__":
+                self.kill_now = True
+                # 立刻打断 accept()，否则 stop 要等满 30s 超时才生效
+                try:
+                    self.srv.close()
+                except Exception:
+                    pass
+                return
+            self.run(script, conn)
+        except Exception as e:
+            self.log("handle error: %r" % e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        self.log("keeper down")
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        sock_path, pid_file = paths(self.host)[0], paths(self.host)[1]
+        try:
+            mine = open(pid_file).read().strip() == str(os.getpid())
+        except OSError:
+            mine = False
+        if not mine:
+            return          # 文件已被新 keeper 接手，别删它的
+        for p in (sock_path, pid_file):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def live_keeper(sock_path, pid_file):
+    """pid 文件指向的进程活着、并且它的 socket 真的能连上。"""
+    try:
+        pid = int(open(pid_file).read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(2)
+        s.connect(sock_path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+class _Queue:
+    """极简阻塞队列（避免 import queue 的额外开销可忽略，这里只为清晰）。"""
+
+    def __init__(self):
+        import queue
+        self._q = queue.Queue()
+
+    def put(self, item):
+        self._q.put(item)
+
+    def get(self, timeout=None):
+        return self._q.get(timeout=timeout)
+
+
+# ---------------------------------------------------------------- 客户端
+
+def spawn_keeper(host, verbose=False):
+    """加锁起 keeper：多客户端同时首连时只起一个。返回已连上的 socket 或 None。"""
+    sock_path = paths(host)[0]
+    lock_path = os.path.join(CACHE, host + ".lock")
+    try:
+        lf = open(lock_path, "a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(sock_path)
+            return s              # 别人已经起好了
+        except OSError:
+            s.close()
+        kind = detect_kind(host)
+        if verbose:
+            sys.stderr.write("sess: 启动会话 %s (%s)\n" % (host, kind))
+        subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                          "__keeper", host, kind],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True,
+                         close_fds=True)
+        return None
+    finally:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+            lf.close()
+        except OSError:
+            pass
+
+
+def src_sig():
+    """当前 sess 源码指纹：改了代码就让旧 keeper 退役，避免老逻辑继续服务。"""
+    st = os.stat(os.path.abspath(__file__))
+    return "%d:%d" % (int(st.st_mtime), st.st_size)
+
+
+def stale_keeper(host):
+    try:
+        return open(os.path.join(CACHE, host + ".sig")).read().strip() != src_sig()
+    except OSError:
+        return True     # 没有指纹 = 老版本 keeper，退役重建
+
+
+def connect(host, autostart=True, verbose=False):
+    sock_path = paths(host)[0]
+    if autostart and stale_keeper(host):
+        if verbose:
+            sys.stderr.write("sess: %s 的会话是旧代码，重建\n" % host)
+        cmd_stop(host, quiet=True)
+        wait_gone(host)
+    for attempt in range(200 if autostart else 1):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(sock_path)
+            return s
+        except OSError:
+            s.close()
+            if not autostart:
+                return None
+            if attempt == 0:
+                s = spawn_keeper(host, verbose)
+                if s is not None:
+                    return s
+            time.sleep(0.1)
+    return None
+
+
+def cmd_run(host, script, new=False, verbose=False):
+    if new:
+        cmd_stop(host, quiet=True)
+        wait_gone(host)
+    s = connect(host, verbose=verbose)
+    if s is None:
+        sys.stderr.write("sess: 连不上会话 %s\n" % host)
+        return 1
+    s.sendall(script.replace("\r\n", "\n").encode() + b"\n")
+    code = 1
+    out = sys.stdout.buffer
+    err = sys.stderr.buffer
+    buf = b""
+    try:
+        while True:
+            try:
+                chunk = s.recv(65536)
+            except ConnectionResetError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 5:
+                kind = buf[0:1]
+                n = struct.unpack(">I", buf[1:5])[0]
+                if len(buf) < 5 + n:
+                    break
+                data = buf[5:5 + n]
+                buf = buf[5 + n:]
+                if kind == b"O":
+                    out.write(data)
+                    out.flush()
+                elif kind == b"E":
+                    err.write(data)
+                    err.flush()
+                elif kind == b"R":
+                    code = struct.unpack(">i", data)[0]
+                    return code
+    finally:
+        s.close()
+    if code == 1 and not buf:
+        sys.stderr.write("sess: %s 会话无响应（可能刚被关闭），可用 --new 重建\n" % host)
+    return code
+
+
+def wait_gone(host, timeout=5.0):
+    """等 keeper 真正退出（socket 文件消失），避免 client 连到正在关闭的旧会话。"""
+    sock_path = paths(host)[0]
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if not os.path.exists(sock_path):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def cmd_stop(host=None, quiet=False):
+    hosts = [host] if host else alive_hosts()
+    for h in hosts:
+        s = connect(h, autostart=False)
+        if s is None:
+            if not quiet:
+                sys.stderr.write("sess: %s 没有运行中的会话\n" % h)
+            continue
+        try:
+            s.sendall(b"__STOP__\n")
+            s.close()
+        except OSError:
+            pass
+        wait_gone(h)
+        if not quiet:
+            sys.stdout.write("sess: 已关闭 %s\n" % h)
+    return 0
+
+
+def alive_hosts():
+    if not os.path.isdir(CACHE):
+        return []
+    return [f[:-len(PROTO) - 4] for f in os.listdir(CACHE) if f.endswith(PROTO + ".pid")]
+
+
+def cmd_list():
+    hs = alive_hosts()
+    if not hs:
+        print("（没有运行中的会话）")
+        return 0
+    for h in sorted(hs):
+        sock_path, pid_file, kind_file, _ = paths(h)
+        pid = open(pid_file).read().strip()
+        alive = os.path.exists("/proc/" + pid)
+        kind = open(kind_file).read().strip() if os.path.exists(kind_file) else "?"
+        print("%-16s %-8s pid=%-7s %s" % (h, kind, pid, "运行中" if alive else "已死（残留文件）"))
+    return 0
+
+
+def cmd_kind(host, reset=False):
+    if reset:
+        try:
+            os.unlink(paths(host)[2])
+            print("已清除 %s 的类型缓存" % host)
+        except OSError:
+            pass
+    print(detect_kind(host))
+    return 0
+
+
+def main(argv):
+    ensure_cache()
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    op = args[0]
+    if op == "__keeper":
+        Keeper(args[1], args[2]).serve()
+        return 0
+    if op == "run":
+        new = False
+        verbose = False
+        rest = args[1:]
+        while rest and rest[0].startswith("-"):
+            if rest[0] == "--new":
+                new = True
+            elif rest[0] in ("-v", "--verbose"):
+                verbose = True
+            rest = rest[1:]
+        if len(rest) < 2:
+            sys.stderr.write("用法: sess run [--new] <host> '<命令>'\n")
+            return 2
+        return cmd_run(rest[0], " ".join(rest[1:]), new=new, verbose=verbose)
+    if op == "list":
+        return cmd_list()
+    if op == "stop":
+        return cmd_stop(args[1] if len(args) > 1 else None)
+    if op == "kind":
+        rest = args[1:]
+        reset = "--reset" in rest
+        rest = [a for a in rest if a != "--reset"]
+        return cmd_kind(rest[0], reset=reset)
+    sys.stderr.write("未知子命令: %s\n" % op)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

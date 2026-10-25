@@ -1,0 +1,109 @@
+#!/bin/sh
+# wsh —— Windows 目标专用 ssh 外壳（要求远端默认 shell 是 PowerShell，win 上即 pwsh 7）
+#
+# 用法：
+#   wsh <host>                     # 交互登录
+#   wsh <host> '<PowerShell 代码>'  # 执行（多行也行，本地绝不做引号解析）
+#   wsh -f <host> <本地脚本.ps1>    # 执行本地脚本文件
+#   wsh -f <host> -                # 从 stdin 读脚本
+#   wsh --sess <host> '<代码>'      # 走 sess 常驻会话（≈45ms/条，比单次 ssh 快 9 倍，
+#                                  #   且 $env:/Set-Location 跨命令保留；无 20KB 命令行限制）
+#
+# 为什么不再用 `ssh win 'powershell -Command "..."'`：
+#   1) 脚本本地转 base64，只由远端默认 shell 解码执行 —— 引号、$、反引号、换行、中文全免转义
+#   2) 不嵌套子进程：Windows OpenSSH 下嵌套 pwsh/cmd 的退出码一律被吞成 1，只有本进程 exit 才透传
+#   3) 输出编码强制 UTF-8（中文不乱码），吞掉 CLIXML / progress 噪声
+#   4) 尾部显式 `exit`，所以 $LASTEXITCODE / 非终止错误都能变成真实退出码
+#
+# 注意：脚本上限约 20KB（Windows 命令行长度限制）。更大请先 scp 上去再执行。
+
+set -u
+
+PROLOGUE='$ProgressPreference="SilentlyContinue"
+$ErrorActionPreference="Continue"
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    # Windows PowerShell 5.1 默认按 ANSI/CLIXML 输出，必须显式转 UTF-8
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+    try { $OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+} else {
+    # pwsh 7 管道输出本来就是 UTF-8 no-BOM；再赋一次 Console.OutputEncoding 会白白多花约 280ms
+    try { $PSStyle.OutputRendering = "PlainText" } catch {}
+}'
+
+EPILOGUE='$__ok = $?
+$__code = $LASTEXITCODE
+if (-not $__ok) {
+    if ($__code -is [int] -and $__code -ne 0) { exit $__code }
+    exit 1
+}
+exit 0'
+
+mkcmd() {
+    # $1 = 脚本文本；输出一条不含双引号的远端命令
+    b64=$(printf '%s' "$1" | base64 -w0)
+    printf '%s' "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64'))))"
+}
+
+if [ -x "$HOME/.local/bin/ssh-unlock" ]; then
+    "$HOME/.local/bin/ssh-unlock" >/dev/null 2>&1 || true
+fi
+
+mode=arg
+use_sess=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f) mode=file; shift ;;
+        -S|--sess) use_sess=1; shift ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "wsh: 未知选项 $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+[ $# -ge 1 ] || { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+host=$1; shift
+
+case "$mode" in
+    file)
+        src=${1:-}
+        [ -n "$src" ] || { echo "wsh: -f 需要脚本路径（用 - 表示 stdin）" >&2; exit 2; }
+        if [ "$src" = "-" ]; then
+            body=$(cat)
+        else
+            [ -r "$src" ] || { echo "wsh: 读不到 $src" >&2; exit 2; }
+            body=$(cat "$src")
+        fi
+        ;;
+    arg)
+        if [ $# -eq 0 ]; then
+            exec ssh -t "$host"
+        fi
+        body=$*
+        ;;
+esac
+
+# --sess：交给常驻会话执行（协议、base64、退出码都由 sess 负责，本脚本只管转发）
+if [ "$use_sess" -eq 1 ] && [ -n "$body" ]; then
+    exec "$HOME/.local/bin/sess" run "$host" "$body"
+fi
+
+# 探一次：远端默认 shell 必须是 PowerShell，且 exit 码能透传
+cache_dir="$HOME/.cache/wsh"
+mkdir -p "$cache_dir" 2>/dev/null
+if [ ! -f "$cache_dir/$host" ]; then
+    timeout 30 ssh -T "$host" "& ([scriptblock]::Create('exit 42'))" >/dev/null 2>&1
+    if [ $? -ne 42 ]; then
+        cat >&2 <<'EOF'
+wsh: 远端默认 shell 不是 PowerShell（exit 码无法透传）。
+     在 Windows 上以管理员身份修正一次即可：
+       New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
+         -Value 'C:\Program Files\PowerShell\7\pwsh.exe' -PropertyType String -Force
+       Restart-Service sshd
+EOF
+        exit 3
+    fi
+    printf 'ps\n' > "$cache_dir/$host"
+fi
+
+exec ssh -T "$host" "$(mkcmd "$(printf '%s\n%s\n%s\n' "$PROLOGUE" "$body" "$EPILOGUE")")"
