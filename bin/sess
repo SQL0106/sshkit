@@ -19,6 +19,7 @@
 import base64
 import errno
 import fcntl
+import io
 import os
 import signal
 import socket
@@ -143,15 +144,21 @@ def shquote(s):
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+# 持久的 keeper 必须能感知链路死亡（笔记本休眠/换网后 TCP 半开）：
+# 没有保活时 ssh 子进程永远不退出，keeper 变成僵尸，socket 还在、命令发进去没人接。
+KEEPALIVE = ["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+             "-o", "TCPKeepAlive=yes"]
+
+
 def ssh_command(host, kind):
     if kind == "posix":
         # 关键：远端登录 shell 可能是 zsh/sh，一律强制落 bash（LLM 的知识默认是 bash）
         loop = shquote(POSIX_LOOP)
         boot = ("if command -v bash >/dev/null 2>&1; then exec bash --noprofile --norc -c %s; "
                 "else exec sh -c %s; fi" % (loop, loop))
-        return ["ssh", "-T", host, boot]
+        return ["ssh", "-T"] + KEEPALIVE + [host, boot]
     blob = base64.b64encode(PWSH_LOOP.encode()).decode()
-    return ["ssh", "-T", host,
+    return ["ssh", "-T"] + KEEPALIVE + [host,
             "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString("
             "[Convert]::FromBase64String('" + blob + "'))))"]
 
@@ -564,48 +571,93 @@ def connect(host, autostart=True, verbose=False):
     return None
 
 
+PROBE_DEADLINE = 1.5
+
+
+def _drain(s, out, err, deadline=None):
+    """读帧直到 R（退出码）帧；deadline 秒内没等到就返回 None（= 会话不健康）。"""
+    if deadline is not None:
+        s.settimeout(deadline)
+    code = None
+    buf = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            return None
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while len(buf) >= 5:
+            kind = buf[0:1]
+            n = struct.unpack(">I", buf[1:5])[0]
+            if len(buf) < 5 + n:
+                break
+            data = buf[5:5 + n]
+            buf = buf[5 + n:]
+            if kind == b"O":
+                out.write(data)
+                out.flush()
+            elif kind == b"E":
+                err.write(data)
+                err.flush()
+            elif kind == b"R":
+                return struct.unpack(">i", data)[0]
+    return code
+
+
+def healthy(host):
+    """独立连接上发一条 `1` 探活：3 秒内有 R 帧才算 keeper 活着。
+
+    必须单开连接：keeper 是「一个连接跑一条命令」，探活占用的连接不能复用。
+    """
+    s = connect(host, autostart=False)
+    if s is None:
+        return True     # 没有 socket 说明keeper没起，交给正常流程 spawn
+    sink = io.BytesIO()
+    try:
+        s.sendall(b"1\n")
+        return _drain(s, sink, sink, deadline=PROBE_DEADLINE) is not None
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 def cmd_run(host, script, new=False, verbose=False):
     if new:
         cmd_stop(host, quiet=True)
         wait_gone(host)
+    out = sys.stdout.buffer
+    err = sys.stderr.buffer
+    # 陈旧 keeper 自愈：socket 在、但命令不回 = keeper 的 ssh 已死。
+    # 不探活的话，每条命令都要等到远端超时（实测过 147 秒），比直连还慢。
+    if not healthy(host):
+        if verbose:
+            sys.stderr.write("sess: %s 会话无响应，重建\n" % host)
+        hard_stop(host)
     s = connect(host, verbose=verbose)
     if s is None:
         sys.stderr.write("sess: 连不上会话 %s\n" % host)
         return 1
-    s.sendall(script.replace("\r\n", "\n").encode() + b"\n")
-    code = 1
-    out = sys.stdout.buffer
-    err = sys.stderr.buffer
-    buf = b""
     try:
-        while True:
-            try:
-                chunk = s.recv(65536)
-            except ConnectionResetError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            while len(buf) >= 5:
-                kind = buf[0:1]
-                n = struct.unpack(">I", buf[1:5])[0]
-                if len(buf) < 5 + n:
-                    break
-                data = buf[5:5 + n]
-                buf = buf[5 + n:]
-                if kind == b"O":
-                    out.write(data)
-                    out.flush()
-                elif kind == b"E":
-                    err.write(data)
-                    err.flush()
-                elif kind == b"R":
-                    code = struct.unpack(">i", data)[0]
-                    return code
+        s.sendall(script.replace("\r\n", "\n").encode() + b"\n")
+    except OSError:
+        s.close()
+        sys.stderr.write("sess: 发送失败 %s\n" % host)
+        return 1
+    try:
+        code = _drain(s, out, err)
     finally:
         s.close()
-    if code == 1 and not buf:
+    if code is None:
         sys.stderr.write("sess: %s 会话无响应（可能刚被关闭），可用 --new 重建\n" % host)
+        return 1
     return code
 
 
@@ -618,6 +670,30 @@ def wait_gone(host, timeout=5.0):
             return True
         time.sleep(0.05)
     return False
+
+
+def hard_stop(host):
+    """直接 SIGKILL keeper 并清掉残留 socket；用于无响应的会话（__STOP__ 会写进黑洞）。"""
+    sock_path, pid_file, _, _ = paths(host)
+    try:
+        pid = int(open(pid_file).read().strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid:
+        for sig in (signal.SIGKILL,):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        for _ in range(50):
+            if not os.path.exists("/proc/%d" % pid):
+                break
+            time.sleep(0.02)
+    for f in (sock_path, pid_file):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
 
 
 def cmd_stop(host=None, quiet=False):
