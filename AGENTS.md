@@ -12,8 +12,8 @@
 
 ## 约定
 - **改这四个工具请在本仓库改，push 后再拷到 `~/.local/bin`**（不要直接改 `~/.local/bin`）。
-- **`wsh` 默认是一次性 ssh（直连）**，`--sess` 才走常驻会话。理由：sess 依赖 keeper 守护进程，keeper 反复 respawn 时每条命令都退化成新建连接（实测某机上 `--sess` 单条 147 s，反而不如直连 32 s）。默认值取「永远能跑通」的那个。
-- 想用 sess 加速，先 `sess list` 看 keeper，再实测 `wsh --sess <host> 1`；只有稳定在 100 ms 量级才在多条命令里用它，退化就立刻退回默认。
+- **`wsh` 默认走 sess 常驻会话**（实测 70-120 ms/条）。`--direct` 才是强制一次性 ssh（0.4 s～30 s 握手），只在需要干净会话时用。
+- sess 唯一的故障模式是 **keeper 变陈旧**：现象是每条命令几十秒（实测 147 s）。修法固定三步：`sess run <host> 1` 两次看耗时 → `sess stop <host>` → 再测。**不要退回裸 ssh。**
 - README 与脚本**保持脱敏**：示例主机写 `linux-host` / `win-host`，不写真实别名、IP、用户名。
 - 一律显式落 bash（远端登录 shell 可能是 zsh）：`rsh`/`sess` 已内置 `bash --noprofile --norc`。
 - `rsh` 远端跑 `bash --noprofile --norc`，**PATH 不含 `~/.local/bin`**，调这些工具要用绝对路径。
@@ -30,4 +30,4 @@
 ## 性能参考（本机实测）
 - Linux：`ssh` 有 ControlMaster 时 16ms，`sess` 44ms → **单条命令直接 ssh/rsh，批处理/需要状态才用 sess**。
 - Windows：`sess` 45ms vs 每次新连接 400ms（8.7 倍）。
-- **反例（2026-11-01 实测）**：某台 Windows 上 keeper 反复 respawn 时，`wsh --sess host 1` 单条 **147 s**，而 `wsh host 1` 直连 32 s。→ 这就是 `wsh` 默认直连的原因；sess 必须先实测再依赖。
+- **2026-11-01 实测**：keeper 陈旧时 `wsh --sess host 1` 单条 **147 s**；`sess stop host` 重建后同一命令 **49～51 ms**，`wsh host 1` 70～120 ms。→ 慢不是 sess 的锅，是 keeper 陈旧，重置即可。

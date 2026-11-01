@@ -6,15 +6,13 @@
 #   wsh <host> '<PowerShell 代码>'  # 执行（多行也行，本地绝不做引号解析）
 #   wsh -f <host> <本地脚本.ps1>    # 执行本地脚本文件
 #   wsh -f <host> -                # 从 stdin 读脚本
-#   wsh --direct <host> '<代码>'    # 强制一次性 ssh（默认就是直连，此参数保留为显式写法）
-#   wsh --sess <host> '<代码>'      # 走 sess 常驻会话（≈100ms/条，$env:/Set-Location 跨命令保留，
-#                                  #   无 20KB 上限；但 keeper 若反复 respawn 会比直连还慢，见下）
+#   wsh --direct <host> '<代码>'    # 强制一次性 ssh（默认走 sess；keeper 异常时用）
+#   wsh --sess <host> '<代码>'      # 兼容写法，等同默认
 #
-# 默认 = 一次性 ssh（直连），因为这是最不容易出错的路径。
-# sess 快得多（100ms vs 0.4～30s 握手），但依赖一个常驻 keeper 守护进程；keeper 一旦
-# 反复重建（源码更新、socket 冲突、目标机器一断一续），每条命令都会退化成新建连接。
-# 所以默认值取「永远能跑通」的那个，sess 由调用方按需显式开启。
-# 判断依据：先 `sess list`，再实测 `wsh --sess <host> 1`；稳定在 100ms 量级才在脚本里用它。
+# 默认 = sess 常驻会话（实测 49～51 ms/条，直连 0.4 s～30 s 握手）。
+# 唯一风险：keeper 变陈旧时每条命令都会退化（曾实测 147 s）。健康检查就一条：
+#   sess run <host> 1  连跑两次；第二次应在 100 ms 内。慢就先 `sess stop <host>` 重建。
+# 需要干净会话（脚本会改会话级状态）时加 --direct。
 #
 # 为什么不再用 `ssh win 'powershell -Command "..."'`：
 #   1) 脚本本地转 base64，只由远端默认 shell 解码执行 —— 引号、$、反引号、换行、中文全免转义
@@ -56,7 +54,7 @@ if [ -x "$HOME/.local/bin/ssh-unlock" ]; then
 fi
 
 mode=arg
-use_sess=0
+use_sess=1
 [ "${WSH_DIRECT:-0}" = "1" ] && use_sess=0
 HELP="awk 'NR>1 && /^#/ {sub(/^# ?/,\"\"); print; next} NR>1 {exit}' \"\$0\""
 while [ $# -gt 0 ]; do
