@@ -6,8 +6,15 @@
 #   wsh <host> '<PowerShell 代码>'  # 执行（多行也行，本地绝不做引号解析）
 #   wsh -f <host> <本地脚本.ps1>    # 执行本地脚本文件
 #   wsh -f <host> -                # 从 stdin 读脚本
-#   wsh --sess <host> '<代码>'      # 走 sess 常驻会话（≈45ms/条，比单次 ssh 快 9 倍，
-#                                  #   且 $env:/Set-Location 跨命令保留；无 20KB 命令行限制）
+#   wsh --direct <host> '<代码>'    # 强制一次性 ssh（默认就是直连，此参数保留为显式写法）
+#   wsh --sess <host> '<代码>'      # 走 sess 常驻会话（≈100ms/条，$env:/Set-Location 跨命令保留，
+#                                  #   无 20KB 上限；但 keeper 若反复 respawn 会比直连还慢，见下）
+#
+# 默认 = 一次性 ssh（直连），因为这是最不容易出错的路径。
+# sess 快得多（100ms vs 0.4～30s 握手），但依赖一个常驻 keeper 守护进程；keeper 一旦
+# 反复重建（源码更新、socket 冲突、目标机器一断一续），每条命令都会退化成新建连接。
+# 所以默认值取「永远能跑通」的那个，sess 由调用方按需显式开启。
+# 判断依据：先 `sess list`，再实测 `wsh --sess <host> 1`；稳定在 100ms 量级才在脚本里用它。
 #
 # 为什么不再用 `ssh win 'powershell -Command "..."'`：
 #   1) 脚本本地转 base64，只由远端默认 shell 解码执行 —— 引号、$、反引号、换行、中文全免转义
@@ -50,18 +57,21 @@ fi
 
 mode=arg
 use_sess=0
+[ "${WSH_DIRECT:-0}" = "1" ] && use_sess=0
+HELP="awk 'NR>1 && /^#/ {sub(/^# ?/,\"\"); print; next} NR>1 {exit}' \"\$0\""
 while [ $# -gt 0 ]; do
     case "$1" in
         -f) mode=file; shift ;;
         -S|--sess) use_sess=1; shift ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --direct|--no-sess) use_sess=0; shift ;;
+        -h|--help) eval "$HELP"; exit 0 ;;
         --) shift; break ;;
         -*) echo "wsh: 未知选项 $1" >&2; exit 2 ;;
         *) break ;;
     esac
 done
 
-[ $# -ge 1 ] || { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 1 ] || { eval "$HELP"; exit 2; }
 host=$1; shift
 
 case "$mode" in
@@ -83,9 +93,20 @@ case "$mode" in
         ;;
 esac
 
-# --sess：交给常驻会话执行（协议、base64、退出码都由 sess 负责，本脚本只管转发）
+# --sess：交给常驻会话执行（协议、base64、退出码都由 sess 负责）
+# 没有 sess 可执行文件时自动回落到一次性 ssh，不报错
 if [ "$use_sess" -eq 1 ] && [ -n "$body" ]; then
-    exec "$HOME/.local/bin/sess" run "$host" "$body"
+    sess_bin=""
+    for c in "$HOME/.local/bin/sess" /usr/local/bin/sess; do
+        [ -x "$c" ] && { sess_bin=$c; break; }
+    done
+    if [ -z "$sess_bin" ]; then
+        sess_bin=$(command -v sess 2>/dev/null || true)
+    fi
+    if [ -n "$sess_bin" ]; then
+        exec "$sess_bin" run "$host" "$body"
+    fi
+    echo "wsh: 未找到 sess，回落一次性 ssh" >&2
 fi
 
 # 探一次：远端默认 shell 必须是 PowerShell，且 exit 码能透传

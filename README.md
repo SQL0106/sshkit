@@ -41,13 +41,19 @@ rsh --sess linux-host 'cd /var/log; pwd'   # 下一条命令仍在 /var/log
 | 场景 | 用什么 | 典型耗时 |
 |---|---|---|
 | Linux 单条命令 | `rsh host '<cmd>'` | ~33 ms |
-| Windows 单条命令 | `wsh host '<pwsh>'` | ~460 ms |
-| 需要保留 `cd`/env/函数，或连续多条 | `rsh --sess host '<cmd>'` / `wsh --sess host '<pwsh>'` | ~45 ms/条 |
-| 整段本地脚本 | `rsh -f host ./script.sh` | 一条 ssh |
-| 交互登录 | `rsh host` | — |
+| **Windows 任何命令** | **`wsh host '<pwsh>'`**（默认一次性 ssh，永远能跑通） | 握手 0.4 s ～ 30 s + 命令 |
+| Windows 连续多条 / 确认 sess 健康 | `wsh --sess host '<pwsh>'` | ~100 ms/条 |
+| 需要保留 `cd`/env/函数（Linux） | `rsh --sess host '<cmd>'` | ~45 ms/条 |
+| 整段本地脚本 | `rsh -f host ./script.sh` / `wsh -f host ./script.ps1` | 一条命令 |
+| 交互登录 | `rsh host` / `wsh host` | — |
 | 原生 shell（zsh/fish） | `rsh -n host '<cmd>'` | ~33 ms |
 
-一句话：**Windows 必用 `--sess`；Linux 单条命令用 `rsh`，批处理或需要状态才上 `--sess`。**
+**硬规则（不要自行发挥）：**
+1. 目标是 Windows → **只写 `wsh`**，不要手写 `ssh host 'powershell ...'`：嵌套子进程的退出码会被吞成 1。
+2. 目标是 Linux → 单条 `rsh`；要保留状态或连续多条 → `rsh --sess`。
+3. `wsh` 默认直连（最保险）。要用 sess 加速，先 `sess list` 看 keeper 是否稳定，再实测 `wsh --sess <host> 1` 是否真的在 100 ms 量级；**keeper 反复 respawn 时 sess 会比直连还慢，此时立刻退回默认**。
+4. 觉得慢或行为怪 → `sess stop <host>` 让它重建，再测；不要退回裸 ssh。
+5. 批量/长脚本优先 `-f <脚本>`，别把几十行塞进命令行（20 KB 上限）。
 
 ## rsh
 
