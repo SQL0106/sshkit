@@ -13,6 +13,7 @@
 ## 约定
 - **改这四个工具请在本仓库改，push 后再拷到 `~/.local/bin`**（不要直接改 `~/.local/bin`）。
 - **`wsh` 默认走 sess 常驻会话**（实测 70-120 ms/条）。`--direct` 才是强制一次性 ssh（0.4 s～30 s 握手），只在需要干净会话时用。
+- **禁止「写 .ps1 落地再用 `powershell.exe -File` 执行」**（用户 2026-11-05：会在交互桌面弹蓝窗）。`wsh` 从不写 .ps1，两条正路：`wsh host -f - <<'PS' … PS`（stdin 内联）或 `wsh -f host ./x.ps1`（本地读、远端 session 0 执行、无窗口）。脚本 >20KB 才落文件：`scp` 上去后 `wsh host '& C:\path\x.ps1'`（同样无窗口）。确实要在交互桌面隐形执行才用 `Start-Process -WindowStyle Hidden` 或计划任务「不管用户是否登录都运行」（session 0）。
 - sess 唯一的故障模式是 **keeper 变陈旧**：现象是每条命令几十秒（实测 147 s）。修法固定三步：`sess run <host> 1` 两次看耗时 → `sess stop <host>` → 再测。**不要退回裸 ssh。**
 - README 与脚本**保持脱敏**：示例主机写 `linux-host` / `win-host`，不写真实别名、IP、用户名。
 - 一律显式落 bash（远端登录 shell 可能是 zsh）：`rsh`/`sess` 已内置 `bash --noprofile --norc`。

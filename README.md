@@ -119,6 +119,17 @@ wsh --cmd win-host 'echo %COMPUTERNAME%'     # 等价写法
 
 远端收到的命令形如 `& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>'))))` —— 命令行里不含双引号，也不启动子进程。
 
+> **不要写 `.ps1` 文件再用 `powershell.exe -File` 去执行。** `wsh` 本来就从不写文件，脚本全程内联：交互桌面里用 `powershell -File` 会弹一个蓝窗被人看到，而 `wsh` 走 ssh 的 session 0，没有任何窗口。需要多行就直接喂 stdin：
+>
+> ```sh
+> wsh win-host -f - <<'PS'
+> Get-ChildItem C:\ | Measure-Object
+> "done"
+> PS
+> ```
+>
+> 只有脚本超过 ~20KB 命令行上限时才需要落文件（`scp` 到 Windows），执行仍走 `wsh host '& C:\path\x.ps1'` —— 依旧无窗口。
+
 - **解释器**：`--shell auto|pwsh|ps5|cmd`（默认 auto = 跟随远端默认 shell）。别名：`--pwsh`/`--ps7`、`--ps5`/`--powershell`、`--cmd`。
   - 目标 == 默认 shell → 本进程执行，最快（pwsh 约 70ms/条）。
   - 跨解释器 → 起子进程：`pwsh.exe` / `powershell.exe -NoProfile -EncodedCommand <UTF-16LE base64>`，引号/换行/中文全免转义；代价是一次进程启动（ps5 约 +300ms，cmd 约 +20ms）。
