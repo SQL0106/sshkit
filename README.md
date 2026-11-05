@@ -126,7 +126,11 @@ wsh --cmd win-host 'echo %COMPUTERNAME%'     # 等价写法
   - 子进程执行**不共享会话状态**（`cd`、`$env:` 不保留），要连续状态就整段写成 `-f` 脚本一次跑完。
 - **多行 cmd**：`cmd /c` 只执行第一条命令行，`wsh` 会自动把多行折成 ` & ` 连接（因此 `goto`/label 不可用）。
 - **退出码**：尾部显式 `exit`，先看 `$?` 再看 `$LASTEXITCODE`，非零就原样回传；cmd 走 `cmd /c` 的退出码。
-- **编码**：PS7 设 `$PSStyle.OutputRendering="PlainText"` 去掉 ANSI；5.1 才需要显式设 `[Console]::OutputEncoding`（PS7 本来就是 UTF-8，设一次要多花 ~280ms）。
+- **编码**：输出统一强制 UTF-8，中文永远可读（中文 Windows `chcp 936` 下实测：`d6d0cec4` GBK 乱码 → `e4b8ad` UTF-8）。
+  - pwsh 7：管道输出本来就是 UTF-8 no-BOM，只设 `$PSStyle.OutputRendering="PlainText"` 去 ANSI（再设一次 `Console::OutputEncoding` 要多花 ~280ms）。
+  - PS 5.1：**所有路径**都会先注入 `[Console]::OutputEncoding` / `$OutputEncoding` = UTF-8（含默认 shell 就是 5.1 的快路径），所以脚本里不需要再自己写这两行。
+  - cmd：命令含非 ASCII 时前置 `chcp 65001>nul`；个别完全无视控制台代码页的老程序仍会吐 GBK，用 `| iconv -f GBK -t UTF-8` 兜底。
+  - 纯 ASCII 命令不触发任何额外动作，不付开销。
 - **解释器探测**：`$PSVersionTable.PSVersion.Major` → `7*`=pwsh、`5*`（及更老）=ps5；不是 PowerShell 再试 `echo` → cmd。结果缓存在 `~/.cache/wsh/<host>.shell`，`wsh kind [--reset] <host>` 可查/重探。探测失败会打印两行诊断（含 `DefaultShell` 注册表修复命令）并 exit 3。
 - **本地 ssh-agent**：与 `rsh` 同一套——先内联 `ssh-add -l`（约 6ms），健康就不再 fork `ssh-unlock`（省约 25ms）；`rc=2`（socket 陈旧 / agent 已死）就地 `rm -f` + 重启 + 解锁，仍失败只在 **stderr 打一行**诊断。`SSH_AUTH_SOCK` 指向别的（转发）agent 时绝不删/重启。控制：`WSH_AGENT=auto|off`（默认 auto）、`WSH_NO_AGENT_FIX=1`。
 - **上限**：base64 后约 20KB（Windows 命令行长度限制）。更大的脚本先 scp 上去。

@@ -140,3 +140,18 @@ syntax: dash -n / bash -n OK；sh bin/wsh -h 5ms（帮助含 WSH_AGENT=auto|off�
 - 修掉的 bug：`cmd /d /c '<多行>'` 只执行第一条命令行（`@echo off` 时零输出）→ 新增 `cmd_flatten()` 折成 ` & `，`ps_wrap_cmd` 与 direct raw cmd 分支都使用；修后多行 `line1`/`line2` 正常、`-f --shell cmd` → `file-cmd` + `中文测试`。
 - 性能（6 次）：auto(pwsh,sess) 66/68/71/79/88/96 ms；`--shell cmd`(sess) 85/87/90/91/94/98 ms；`--shell ps5`(sess) 332/340/362/377/408/408 ms；`--direct` 687/694/705/725/732/755 ms。
 - 遗留：跨解释器执行不保留 `cd`/`$env:`；多行 cmd 折叠后 `goto`/label 不可用；sess 下 `exit` → 255。
+
+=== 第 27 节 wsh 输出编码统一 UTF-8（2026-11-05，目标 win 10.0.19044 / pwsh 7.6.9 / PS 5.1.19041） ===
+[语法] dash -n: OK；bash -n: OK
+[中文三方] --shell ps5 'Write-Output 中文ABC' / --shell cmd 'echo 中文ABC' / 默认 pwsh → 均 e4 b8 ad e6 96 87 41 42 43（UTF-8），rc=0
+[病根复现] win 上 chcp 936 模拟中文机 + powershell -EncodedCommand：
+           不注入编码 → d6 d0 ce c4 41 42 43（GBK，即用户看到的乱码）
+           前置 PS5_ENC → e4 b8 ad e6 96 87 41 42 43（UTF-8）
+[快路径] 伪 def=ps5（echo ps5 > ~/.cache/wsh/win.shell）→ wsh win 'Write-Output 中文ABC' → UTF-8、rc=0；已恢复缓存为 pwsh
+[-f 中文] wsh -f win .agent/wsh-f-ps.ps1 → file-ps5? 7 + 中文测试（UTF-8 字节）
+[stdin 中文] printf 'Write-Output "stdin中文"\n' | wsh -f win - → 73 74 64 69 6e e4 b8 ad e6 96 87 0d 0a，rc=0
+[退出码] --shell ps5 'exit 5' → 5（PS5_ENC 注入不影响 EPILOGUE）
+[ASCII 开销] 6 次 sess：60/66/67/67/70/71 ms（改动前 66~96ms）→ 纯 ASCII 不付代价
+[改动] PS5_ENC 常量（快路径注入）；cmd 路径 needs_utf8 命中时前置 chcp 65001>nul；ps_wrap_cmd 与 raw 分支都生效
+[兜底] 无视控制台代码页的老程序仍需本地 `| iconv -f GBK -t UTF-8`
+[说明] sister 未触碰（用户明确要求）；raw57.txt 乱码争议已由用户关闭

@@ -58,6 +58,11 @@ if (-not $__ok) {
 }
 exit 0'
 
+# PS5 快路径专用：默认 shell 就是 PS5 时不会注入 PROLOGUE，但编码仍必须强制 UTF-8，
+# 否则中文 Windows（控制台代码页 936）输出的就是 GBK —— 机器能猜、人读是乱码。
+# 单行、不定义变量；实测在 `chcp 936` 环境下能把输出转回 UTF-8。
+PS5_ENC='try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; $OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}'
+
 # ---- 远端命令构造 ---------------------------------------------------------
 
 mkcmd() {
@@ -83,9 +88,17 @@ cmd_flatten() {
     printf '%s\n' "$1" | awk '{ sub(/\r$/, "") } NF == 0 { next } { if (n++) printf " & "; printf "%s", $0 }'
 }
 
+# 只在真含非 ASCII 字节时才动代码页（纯 ASCII 命令不付任何开销）
+needs_utf8() {
+    printf '%s' "$1" | LC_ALL=C grep -q '[^[:print:][:space:]]'
+}
+
 ps_wrap_cmd() {
     # $1 = cmd.exe 命令文本；输出在 PowerShell 里执行它的代码（单引号加倍）
-    _esc=$(printf '%s' "$(cmd_flatten "$1")" | sed "s/'/''/g")
+    _txt=$(cmd_flatten "$1")
+    # 中文 Windows 的 cmd 控制台代码页是 936 → 子进程按 GBK 输出；先切到 65001
+    if needs_utf8 "$_txt"; then _txt="chcp 65001>nul & $_txt"; fi
+    _esc=$(printf '%s' "$_txt" | sed "s/'/''/g")
     printf "& cmd.exe /d /c '%s'" "$_esc"
 }
 
@@ -262,7 +275,8 @@ case "$target" in
         ;;
     ps5)
         if [ "$def_kind" = ps5 ]; then
-            ps_code=$body
+            # 快路径也强制 UTF-8：中文 Windows 上 PS5 默认按控制台代码页（936）输出
+            ps_code=$(printf '%s\n%s' "$PS5_ENC" "$body")
         else
             ps_code=$(mkcmd_ps powershell.exe "$(printf '%s\n%s' "$PROLOGUE" "$body")")
         fi
@@ -291,7 +305,10 @@ if [ "$use_sess" -eq 1 ] && [ -n "$body" ]; then
 fi
 
 if [ "$run_raw" = 1 ]; then
-    exec ssh -T "$host" "$(cmd_flatten "$body")"
+    _raw=$(cmd_flatten "$body")
+    # 中文 Windows 的 cmd 代码页 936 → 外部程序按 GBK 输出；含非 ASCII 时先切 65001
+    if needs_utf8 "$_raw"; then _raw="chcp 65001>nul & $_raw"; fi
+    exec ssh -T "$host" "$_raw"
 fi
 
 exec ssh -T "$host" "$(mkcmd "$(printf '%s\n%s\n%s\n' "$PROLOGUE" "$ps_code" "$EPILOGUE")")"
