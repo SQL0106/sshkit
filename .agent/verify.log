@@ -111,3 +111,10 @@ syntax: dash -n / bash -n OK；sh bin/wsh -h 5ms（帮助含 WSH_AGENT=auto|off�
 开关：WSH_AGENT=off / WSH_NO_AGENT_FIX=1 -> 均不自愈（sock=none unit=failed）
 开销（6 次 min/med，含到 127.0.0.1 的一次性 ssh 探针）：健康 31/38ms vs WSH_AGENT=off 24/26ms -> 探测 +7~12ms
 跳过：win 离线 21h（192.168.1.199 / ts 100.74.19.78），无法实测 wsh win 'echo hi' 与 $PSVersionTable；--sess/-f 依赖 sess 到 win，同样跳过
+
+## 第24节 fedora 真机补测（2026-11-05 21:58，fedora 恢复在线）
+- fedora 192.168.1.200 REACHABLE；`rsh fedora 'echo hi; hostname'` 297ms（含重连）
+- 安装：scp bin/{rsh,wsh} → ~/.local/bin/ + chmod 755；sha256 与仓库 HEAD 一致（rsh ecdc2572… / wsh 339108c1…）；sh -n 均 OK；`wsh -h` 正常
+- 本地 agent 真死自愈：stop ssh-agent + rm socket 后**一次** `rsh fedora 'ssh-add -l'` → 816ms 自愈，列出 256 SHA256:YmRtg6Xa/… (ED25519)
+- `git ls-remote git@github.com:SQL0106/sshkit.git HEAD` → dbfce9633f43bd68bd2dadc86fa7a551098d35ad（= 最新提交）
+- 计时 10 次 `rsh fedora 'echo hi'`：min 48ms / max 85ms（判据 <500ms）
