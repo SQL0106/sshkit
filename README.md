@@ -44,6 +44,7 @@ rsh --sess linux-host 'cd /var/log; pwd'   # 下一条命令仍在 /var/log
 | **Windows 任何命令** | **`wsh host '<pwsh>'`**（默认走 sess 常驻会话） | **~70-120 ms** |
 | Windows 强制一次性 ssh | `wsh --direct host '<pwsh>'` | 握手 0.4 s ～ 30 s |
 | Windows 换解释器（5.1 / cmd） | `wsh --shell ps5 host '<ps>'` / `wsh --shell cmd host '<cmd>'` | ps5 ~370 ms / cmd ~90 ms |
+| 查远端默认解释器 | `wsh kind host`（`--reset` 重探） | 首次 ~0.5 s，之后 3 ms（读缓存） |
 | 需要保留 `cd`/env/函数（Linux） | `rsh --sess host '<cmd>'` | ~45 ms/条 |
 | 整段本地脚本 | `rsh -f host ./script.sh` / `wsh -f host ./script.ps1` | 一条命令 |
 | 交互登录 | `rsh host` / `wsh host` | — |
@@ -130,9 +131,29 @@ wsh --cmd win-host 'echo %COMPUTERNAME%'     # 等价写法
 >
 > 只有脚本超过 ~20KB 命令行上限时才需要落文件（`scp` 到 Windows），执行仍走 `wsh host '& C:\path\x.ps1'` —— 依旧无窗口。
 
+### 解释器探测与切换
+
+远端 `DefaultShell` 是三种里的哪一种，都不影响用法；`wsh` 探一次、缓存，之后按目标解释器选最省事的执行方式：
+
+| 目标（`--shell`） | 远端默认 shell | 实际怎么跑 | 额外开销 |
+|---|---|---|---|
+| `auto` / `pwsh` | pwsh 7 | 默认 shell **本进程**跑 scriptblock | 0 |
+| `auto` / `ps5` | 5.1 | 默认 shell **本进程**跑 scriptblock | 0 |
+| `auto` / `cmd` | `cmd.exe` | 命令原文直接发（折叠多行后） | 0（回落一次性 ssh） |
+| `pwsh` | ps5 / cmd | `pwsh.exe -NoProfile -EncodedCommand <base64>` 子进程 | ~300 ms |
+| `ps5` | pwsh / cmd | `powershell.exe -NoProfile -EncodedCommand <base64>` 子进程 | ~300 ms |
+| `cmd` | pwsh / ps5 | `& cmd.exe /d /c '<text>'` 子进程 | ~20 ms |
+
+什么时候真的要换：
+
+- 只有 .NET Framework 才有的老 cmdlet（`Get-WmiObject`、部分 AD/Exchange 模块）→ `--shell ps5`。
+- 验证 `DefaultShell` 本身的行为差异、或要跑 `.cmd` 批处理 → `--shell cmd`（注意 `goto`/label 因折叠不可用，见上文）。
+- 机器上 pwsh 7 和 5.1 装着不同版本模块 → 显式指定，别依赖自动探测。
+
+缓存与诊断：`~/.cache/wsh/<host>.shell` 内容就是 `pwsh` / `ps5` / `cmd`；换机器版本（如装了 pwsh 7 但 `DefaultShell` 还是 `cmd.exe`）后 `wsh kind --reset <host>` 重探。探测失败会打两行诊断（含 `DefaultShell` 注册表修复命令）并 exit 3。
+
 - **解释器**：`--shell auto|pwsh|ps5|cmd`（默认 auto = 跟随远端默认 shell）。别名：`--pwsh`/`--ps7`、`--ps5`/`--powershell`、`--cmd`。
-  - 目标 == 默认 shell → 本进程执行，最快（pwsh 约 70ms/条）。
-  - 跨解释器 → 起子进程：`pwsh.exe` / `powershell.exe -NoProfile -EncodedCommand <UTF-16LE base64>`，引号/换行/中文全免转义；代价是一次进程启动（ps5 约 +300ms，cmd 约 +20ms）。
+  - 目标 == 默认 shell → 本进程执行，最快（pwsh 约 70ms/条）；跨解释器走子进程，对照表见上一节。
   - cmd 在 PowerShell 默认 shell 下包成 `& cmd.exe /d /c '<text>'`；默认 shell 本身就是 cmd 时直接发原文（此时 sess 不支持，自动回落一次性 ssh）。
   - 子进程执行**不共享会话状态**（`cd`、`$env:` 不保留），要连续状态就整段写成 `-f` 脚本一次跑完。
 - **多行 cmd**：`cmd /c` 只执行第一条命令行，`wsh` 会自动把多行折成 ` & ` 连接（因此 `goto`/label 不可用）。
@@ -142,7 +163,6 @@ wsh --cmd win-host 'echo %COMPUTERNAME%'     # 等价写法
   - PS 5.1：**所有路径**都会先注入 `[Console]::OutputEncoding` / `$OutputEncoding` = UTF-8（含默认 shell 就是 5.1 的快路径），所以脚本里不需要再自己写这两行。
   - cmd：命令含非 ASCII 时前置 `chcp 65001>nul`；个别完全无视控制台代码页的老程序仍会吐 GBK，用 `| iconv -f GBK -t UTF-8` 兜底。
   - 纯 ASCII 命令不触发任何额外动作，不付开销。
-- **解释器探测**：`$PSVersionTable.PSVersion.Major` → `7*`=pwsh、`5*`（及更老）=ps5；不是 PowerShell 再试 `echo` → cmd。结果缓存在 `~/.cache/wsh/<host>.shell`，`wsh kind [--reset] <host>` 可查/重探。探测失败会打印两行诊断（含 `DefaultShell` 注册表修复命令）并 exit 3。
 - **本地 ssh-agent**：与 `rsh` 同一套——先内联 `ssh-add -l`（约 6ms），健康就不再 fork `ssh-unlock`（省约 25ms）；`rc=2`（socket 陈旧 / agent 已死）就地 `rm -f` + 重启 + 解锁，仍失败只在 **stderr 打一行**诊断。`SSH_AUTH_SOCK` 指向别的（转发）agent 时绝不删/重启。控制：`WSH_AGENT=auto|off`（默认 auto）、`WSH_NO_AGENT_FIX=1`。
 - **上限**：base64 后约 20KB（Windows 命令行长度限制）。更大的脚本先 scp 上去。
 
