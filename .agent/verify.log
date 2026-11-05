@@ -155,3 +155,11 @@ syntax: dash -n / bash -n OK；sh bin/wsh -h 5ms（帮助含 WSH_AGENT=auto|off�
 [改动] PS5_ENC 常量（快路径注入）；cmd 路径 needs_utf8 命中时前置 chcp 65001>nul；ps_wrap_cmd 与 raw 分支都生效
 [兜底] 无视控制台代码页的老程序仍需本地 `| iconv -f GBK -t UTF-8`
 [说明] sister 未触碰（用户明确要求）；raw57.txt 乱码争议已由用户关闭
+
+=== 第 28 节 fedora 同步（2026-11-05 晚，fedora 上线后补做） ===
+[判活] ping 192.168.1.200 → LAN_OK（Tailscale 仍 DEAD，用局域网）
+[wsh] scp bin/wsh → fedora:~/.local/bin/wsh；chmod 755；sha256 = 61553170cbd98902b0b825513beaf4f073ca3e4fbf96113b1d63b0f4a8e1df1a（与本机/仓库一致）；sh -n OK；wsh -h 正常
+[全局 AGENTS.md] 就地打补丁（不整文件覆盖，脚本 .agent/patch-fedora-agents.sh 经 rsh -f 执行）：
+                  - 替换 `wsh` bullet 为三解释器 + UTF-8 版本
+                  - 紧随其后插入「硬规则：禁止写 .ps1 后 powershell -File 执行」
+                  - 校验 grep -c '禁止「写 .ps1' = 1；文件 127 行，源码仓库那条 bullet 紧随其后
