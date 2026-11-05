@@ -118,3 +118,11 @@ syntax: dash -n / bash -n OK；sh bin/wsh -h 5ms（帮助含 WSH_AGENT=auto|off�
 - 本地 agent 真死自愈：stop ssh-agent + rm socket 后**一次** `rsh fedora 'ssh-add -l'` → 816ms 自愈，列出 256 SHA256:YmRtg6Xa/… (ED25519)
 - `git ls-remote git@github.com:SQL0106/sshkit.git HEAD` → dbfce9633f43bd68bd2dadc86fa7a551098d35ad（= 最新提交）
 - 计时 10 次 `rsh fedora 'echo hi'`：min 48ms / max 85ms（判据 <500ms）
+
+## 第25节 realme(Android) 真机补测（2026-11-05 22:0x，局域网恢复）
+- 192.168.1.100 REACHABLE（Tailscale 仍 offline 2d，走 LAN）；`rsh realme 'id -u'` → 0，kernel 6.1.157-android14，机型 RMX5062；首连 405ms
+- 远端环境：无 bash / dash / mksh 可执行名，仅 /system/bin/sh；base64/sed/awk 在；git 缺失；无 sudo、无 systemctl --user、无 ~/.ssh/agent.sock、无 ~/.local/bin
+- 功能：`-f`（引号+管道）通过；`-f -` stdin 通过；`--sess` cwd 跨命令保留（/data/local，2 条 567ms）；`-n` 用远端 sh 且 PATH 不被改写（/system/bin:/system/xbin）
+- agent 前导：`rsh realme 'git --version'` 命中正则但无 socket/unit → 静默跳过，stderr 仅 35B（命令自身的 sh: git not found），无 rsh 诊断噪声；`echo hi` stderr 0B
+- `rsh -s realme 'id -u'` → rc=127 `sudo: inaccessible or not found`（Android 无 sudo，环境缺失非缺陷）
+- 计时 10 次 `rsh realme 'echo hi'`：min 69ms / med 96ms / max 173ms（判据 <500ms）

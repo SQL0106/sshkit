@@ -256,12 +256,15 @@ Host *
 - 取舍：**宁可多拦，不可漏放**。误拦的代价只是"改用 `-f`"，漏放的代价是 sudo 语义错乱。
 - 出路：`rsh -f host script.sh`（脚本里自己写 `sudo -n`），或把该模式拆成两条命令。
 
-### 6. 只在 Linux 上实测过
+### 6. 平台覆盖：Linux 与 Android 实测，macOS / Windows 未实测
 
-- 已验证：Debian 13 (aarch64，主线内核)，`dash` / `bash` / `zsh` 语法检查均通过。
-- **未实测**：Android（Termux / KernelSU 环境）、macOS。前导只用 POSIX 内建 + `ssh-add` + `sleep`，理论上都能跑，但没有真机验证。
-- 期望差异：Android 缺 `systemctl --user`（会退到 `ssh-agent -a`）；macOS 无 `/proc`，但前导不依赖它。
-- Windows 侧：`wsh` 的本地 agent 块已在本机验证（含真死自愈），但 `--sess` / `-f` / `--direct` 发到真实 Windows 的路径在开发时**未实测**（目标机全程离线）。
+- **Linux（Debian 13，aarch64 主线内核 + fedora x86_64）**：已实测，`dash` / `bash` / `zsh` 语法检查通过。
+- **Android（realme RMX5062，Android 16 + KernelSU，静态 OpenSSH 8022）**：已实测 —— 普通命令、`-f`（引号/管道脚本）、`-f -`、`--sess`（cwd 跨命令保留）、`-n` 全部正常；单条 69～173 ms。
+  - 远端**没有 bash**，自动退到 `/system/bin/sh`（mksh 派生），`base64 -d` + `eval` 路径可用。
+  - 没有 `systemctl --user`、没有 `sudo`：agent 前导只在 socket/unit 存在时才动手，此处两者都无 → 命中 `git` 等关键字时**静默跳过**；`rsh -s` 会得到 `sudo: inaccessible or not found`（rc 127），这是环境缺失，不是 `rsh` 的问题。
+  - `$HOME/.local/bin` 一般不存在 → PATH 前导自然空转（该分支已用 `env -i` 隔离验证过）。
+- **macOS**：未实测。前导只用 POSIX 内建 + `ssh-add` + `sleep`，不依赖 `/proc`，理论上可跑。
+- **Windows**：`wsh` 的本地 agent 块已在本机验证（含真死自愈），但 `--sess` / `-f` / `--direct` 发到真实 Windows 的路径在开发时**未实测**（目标机全程离线）。
 
 ## 故障排查
 
