@@ -82,6 +82,8 @@ fi
 
 `-s` 是把 `sudo -n ` 直接贴在用户命令前面（不是 `sudo -n bash -c` —— sudoers 按命令路径授权，那样请求必然失败）。因此 `-s` 只接受**单条命令**：出现未转义的 `;`、`&&`、`|` 或换行会直接 `exit 2` 并提示改用 `rsh -f`（脚本里自己写 `sudo -n`）。旧版对复合命令只给第一段加 sudo，`sudo: a password is required` 会和后续输出混在一起，极易误判 —— 这个模糊行为已删除。`find ... \;` 里的转义分号仍放行。
 
+> **守卫是保守的：误拦属预期行为，不是 bug。** 本地不做 shell 解析，分不清「操作符」和「引号内的字符」，所以 `grep 'a|b'`、`sed 's/;/X/'` 这类引号内含 `;`/`|`/`&&` 的单条命令也会被拦（exit 2）。放宽成「引号内放行」需要写引号状态机（嵌套引号、`\` 转义、`awk '{print $1}'` 都要覆盖），一旦误判就会把复合命令当单条命令塞给 `sudo -n` —— 那是真危险的方向。宁可多拦：被拦时按提示改用 `rsh -f`，在脚本里自己写 `sudo -n` 即可。
+
 远端还有两件事在同一条远端命令里顺带处理（**不增加 ssh 往返**）：
 
 - **PATH**：非 `-n` 模式把 `$HOME/.local/bin`（存在时）前置到 PATH，自己装的工具不再 `command not found`。`-n` 保持远端原生 shell 语义不动。
@@ -91,6 +93,8 @@ fi
   - rc=2：socket 陈旧 / agent 已死 → `rm -f` 陈旧 socket → `systemctl --user restart ssh-agent`（无 systemd 时 `ssh-agent -a`）→ 等 agent 起来再解锁。
 
   失败一律静默降级（命令照常执行），只在 stderr 打一行可诊断提示。开关：`RSH_AGENT=auto|always|off`（默认 `auto`；`off` 表示本地远端都不碰），`RSH_NO_AGENT_FIX=1` 彻底关闭。口令只存在于远端登录环境，从不进命令行、不落盘。指向转发 agent 的 `SSH_AUTH_SOCK` 绝不删除或重启。
+
+  **自动探测的边界**（都是刻意取舍，不是缺陷）：① 靠命令文本正则判定，`/usr/bin/rsync` 能中，但经变量/别名间接调用（`R=git; $R clone`）不会触发；② `rsh -f host -`（stdin）不预判脚本内容，默认不探测；③ 远端解锁依赖登录环境导出的 `SSH_PASS`，改用 keyring/secret 服务的机器只会得到提示，不会失败得更隐蔽。三者的统一兜底都是 `RSH_AGENT=always`（无条件探测）。
 
 这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
 
