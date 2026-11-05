@@ -82,7 +82,7 @@ fi
 
 `-s` 是把 `sudo -n ` 直接贴在用户命令前面（不是 `sudo -n bash -c` —— sudoers 按命令路径授权，那样请求必然失败）。因此 `-s` 只接受**单条命令**：出现未转义的 `;`、`&&`、`|` 或换行会直接 `exit 2` 并提示改用 `rsh -f`（脚本里自己写 `sudo -n`）。旧版对复合命令只给第一段加 sudo，`sudo: a password is required` 会和后续输出混在一起，极易误判 —— 这个模糊行为已删除。`find ... \;` 里的转义分号仍放行。
 
-> **守卫是保守的：误拦属预期行为，不是 bug。** 本地不做 shell 解析，分不清「操作符」和「引号内的字符」，所以 `grep 'a|b'`、`sed 's/;/X/'` 这类引号内含 `;`/`|`/`&&` 的单条命令也会被拦（exit 2）。放宽成「引号内放行」需要写引号状态机（嵌套引号、`\` 转义、`awk '{print $1}'` 都要覆盖），一旦误判就会把复合命令当单条命令塞给 `sudo -n` —— 那是真危险的方向。宁可多拦：被拦时按提示改用 `rsh -f`，在脚本里自己写 `sudo -n` 即可。
+> 守卫是**保守**的：本地不做 shell 解析，`grep 'a|b'` 这类引号内含有 `;`/`|`/`&&` 的单条命令也会被拦（exit 2），**属预期行为，不是 bug**。理由与被拦后的出路见 [已知限制](#已知限制)。
 
 远端还有两件事在同一条远端命令里顺带处理（**不增加 ssh 往返**）：
 
@@ -94,7 +94,7 @@ fi
 
   失败一律静默降级（命令照常执行），只在 stderr 打一行可诊断提示。开关：`RSH_AGENT=auto|always|off`（默认 `auto`；`off` 表示本地远端都不碰），`RSH_NO_AGENT_FIX=1` 彻底关闭。口令只存在于远端登录环境，从不进命令行、不落盘。指向转发 agent 的 `SSH_AUTH_SOCK` 绝不删除或重启。
 
-  **自动探测的边界**（都是刻意取舍，不是缺陷）：① 靠命令文本正则判定，`/usr/bin/rsync` 能中，但经变量/别名间接调用（`R=git; $R clone`）不会触发；② `rsh -f host -`（stdin）不预判脚本内容，默认不探测；③ 远端解锁依赖登录环境导出的 `SSH_PASS`，改用 keyring/secret 服务的机器只会得到提示，不会失败得更隐蔽。三者的统一兜底都是 `RSH_AGENT=always`（无条件探测）。
+  **自动探测有边界**（刻意取舍，不是缺陷）：只认命令文本里的 `git`/`ssh` 等字样，`rsh -f host -` 走 stdin 时不探测，远端解锁还依赖登录环境的 `SSH_PASS`。逐条说明与兜底（`RSH_AGENT=always`）见 [已知限制](#已知限制)。
 
 这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
 
@@ -213,6 +213,55 @@ Host *
 |---|---|
 | Linux / Android / macOS | OpenSSH Server；有 bash 最好（没有则退回 sh，`rsh -n` 直接用原生 shell） |
 | Windows | OpenSSH Server（`Add-WindowsCapability -Online -Name OpenSSH.Server*`）；默认 shell 设为 PowerShell 7（`New-ItemProperty ... DefaultShell`）；不需要 Git Bash |
+
+## 已知限制
+
+以下六条都是**刻意的取舍或尚未验证的边界**，不是待修的 bug。若哪天看到"为什么不支持"，先回来读这一节。
+
+### 1. 远端解锁依赖 `~/.bashrc` 导出的 `SSH_PASS`
+
+`ssh-unlock` 用 `$SSH_PASS` 自动 `ssh-add`，而 `SSH_PASS` 通常只写在 `~/.bashrc`，非交互 shell 读不到，所以 `rsh` 的远端前导会退化到 `bash -ic 'ssh-unlock'`。
+
+- **代价**：仅当 agent 真的缺身份时才付 0.5–0.9s（见第 2 条）。
+- **口令源换成 keyring / secret 服务的机器**（`pass`、`secret-tool`、1Password CLI 等）：解锁会失败，`rsh` 只打一行提示，然后照常执行命令。
+- 这是「口令不得进命令行、不得落盘」的直接后果 —— 不把口令塞进远端命令行就没有别的传法。
+- 兜底：把 `SSH_PASS` 也导出到远端非交互环境（例如 `~/.profile`），或让该机的 ssh-agent 常驻并预先解锁。
+
+### 2. `bash -ic` 慢，且依赖 `.bashrc` 可被非交互加载
+
+- 只在**故障路径**（agent 死了/没身份）触发，健康时完全不走。
+- `.bashrc` 极慢、或需要交互输入（如 `read -p`）时，解锁会超时/卡住，最终退化成"打一行提示、命令照常执行"。
+- 想让 `bash -ic` 变快，就在 `.bashrc` 顶部加非交互早退守卫。
+
+### 3. 触发探测靠命令文本正则
+
+`(^|[^[:alnum:]_.-])(git|ssh|scp|sftp|rsync)([[:space:]]|$|-)` —— 写死的文本匹配。
+
+- ✅ `/usr/bin/rsync …`、`sudo git clone …`、`git-lfs …` 都能中。
+- ❌ 变量/别名间接调用不中：`R=git; $R clone`、`eval "$cmd"`、`sh -c 'git clone …'` 里的内层。
+- 兜底：**`RSH_AGENT=always`** 无条件探测（每条命令固定 +10~15ms），或干脆常驻并预先解锁 agent。
+
+### 4. `rsh -f host -`（stdin）默认不探测
+
+脚本要先读进内存才能发包，读之前无法判定内容里有没有 `git`/`ssh`，所以 stdin 模式默认跳过探测。
+
+- 兜底：`RSH_AGENT=always rsh -f host - < script.sh`。
+- 有路径的 `-f host file` 和普通命令模式不受影响（照常按第 3 条判定）。
+
+### 5. `-s` 会拦掉引号内含 `;` / `|` / `&&` 的单条命令
+
+例：`rsh -s host "grep -E 'a|b' /var/log/x"` → exit 2。
+
+- 原因：本地不做 shell 解析，分不清「操作符」和「引号内的字符」。放宽成"引号内放行"需要覆盖嵌套引号、`\` 转义、`awk '{print $1}'`、此处文档字符串等；一旦误判，就会把复合命令当单条命令塞给 `sudo -n`，那是真正危险的方向。
+- 取舍：**宁可多拦，不可漏放**。误拦的代价只是"改用 `-f`"，漏放的代价是 sudo 语义错乱。
+- 出路：`rsh -f host script.sh`（脚本里自己写 `sudo -n`），或把该模式拆成两条命令。
+
+### 6. 只在 Linux 上实测过
+
+- 已验证：Debian 13 (aarch64，主线内核)，`dash` / `bash` / `zsh` 语法检查均通过。
+- **未实测**：Android（Termux / KernelSU 环境）、macOS。前导只用 POSIX 内建 + `ssh-add` + `sleep`，理论上都能跑，但没有真机验证。
+- 期望差异：Android 缺 `systemctl --user`（会退到 `ssh-agent -a`）；macOS 无 `/proc`，但前导不依赖它。
+- Windows 侧：`wsh` 的本地 agent 块已在本机验证（含真死自愈），但 `--sess` / `-f` / `--direct` 发到真实 Windows 的路径在开发时**未实测**（目标机全程离线）。
 
 ## 故障排查
 
