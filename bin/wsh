@@ -1,13 +1,23 @@
 #!/bin/sh
-# wsh —— Windows 目标专用 ssh 外壳（要求远端默认 shell 是 PowerShell，win 上即 pwsh 7）
+# wsh —— Windows 目标专用 ssh 外壳（远端默认 shell 可以是 pwsh / Windows PowerShell / cmd）
 #
 # 用法：
 #   wsh <host>                     # 交互登录
-#   wsh <host> '<PowerShell 代码>'  # 执行（多行也行，本地绝不做引号解析）
-#   wsh -f <host> <本地脚本.ps1>    # 执行本地脚本文件
+#   wsh <host> '<代码>'             # 用「远端默认 shell」执行（多行也行，本地绝不做引号解析）
+#   wsh -f <host> <本地脚本>        # 执行本地脚本文件
 #   wsh -f <host> -                # 从 stdin 读脚本
-#   wsh --direct <host> '<代码>'    # 强制一次性 ssh（默认走 sess；keeper 异常时用）
-#   wsh --sess <host> '<代码>'      # 兼容写法，等同默认
+#   wsh --shell cmd <host> '<cmd>'  # 强制用 cmd.exe 执行（pwsh/ps5 同理）
+#   wsh --shell ps5 <host> '<代码>'  # 强制用 Windows PowerShell 5.1 执行
+#   wsh kind <host>                 # 查看缓存的默认解释器（--reset 重探）
+#   wsh --direct <host> '<代码>'     # 强制一次性 ssh（默认走 sess；keeper 异常时用）
+#   wsh --sess <host> '<代码>'       # 兼容写法，等同默认
+#
+# 解释器：auto（默认）= 远端默认 shell；pwsh = PowerShell 7+；ps5 = Windows PowerShell 5.1；cmd = cmd.exe。
+#   首次用到某台主机时探测一次并存到 ~/.cache/wsh/<host>.shell（pwsh|ps5|cmd），之后零开销；
+#   换了 DefaultShell 用 `wsh kind --reset <host>` 重探。
+#   跨解释器执行走 `pwsh.exe|powershell.exe -NoProfile -EncodedCommand <utf16le-base64>`，引号/换行/中文全免转义。
+#   默认 shell 是 PowerShell 时 cmd 命令被包成 `& cmd.exe /d /c '...'`（单引号自动加倍）；默认是 cmd 时原样发送。
+#   `--shell` 切换会在子进程里跑，cd/env 不跨命令保留（sess 的会话状态只在同解释器时有效）。
 #
 # 默认 = sess 常驻会话（实测 49～51 ms/条，直连 0.4 s～30 s 握手）。
 # 唯一风险：keeper 变陈旧时每条命令都会退化（曾实测 147 s）。健康检查就一条：
@@ -21,6 +31,7 @@
 #   4) 尾部显式 `exit`，所以 $LASTEXITCODE / 非终止错误都能变成真实退出码
 #
 # 注意：脚本上限约 20KB（Windows 命令行长度限制）。更大请先 scp 上去再执行。
+# 本工具不写任何 .ps1 文件，脚本全部内联（远端 %TEMP% 里不会有残留）。
 #
 # 本地 ssh-agent：先内联 `ssh-add -l` 判定（~6ms），健康就不再调 ssh-unlock（省 ~25ms）；
 # socket 陈旧 / agent 已死（rc=2）时就地 rm+重启+解锁，失败只在 stderr 打一行诊断。
@@ -47,27 +58,118 @@ if (-not $__ok) {
 }
 exit 0'
 
+# ---- 远端命令构造 ---------------------------------------------------------
+
 mkcmd() {
-    # $1 = 脚本文本；输出一条不含双引号的远端命令
+    # $1 = PowerShell 脚本文本；输出一条不含双引号的远端命令（默认 shell 是 PowerShell 时用）
     b64=$(printf '%s' "$1" | base64 -w0)
     printf '%s' "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64'))))"
 }
 
+mkcmd_ps() {
+    # $1 = exe 名（pwsh.exe / powershell.exe），$2 = PowerShell 脚本文本
+    # 输出跨解释器命令；脚本按 UTF-16LE 编码，完全绕开 Windows 命令行引号规则
+    if ! command -v iconv >/dev/null 2>&1; then
+        echo "wsh: 跨解释器执行需要 iconv（Debian: apt install libc-bin）" >&2
+        exit 2
+    fi
+    _b64=$(printf '%s' "$2" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+    printf '%s' "$1 -NoProfile -EncodedCommand $_b64"
+}
+
+cmd_flatten() {
+    # cmd /c 只认第一条命令行：多行脚本必须折叠成 `a & b`
+    # （真正的批处理控制流 goto/label 不支持，需要就用 `wsh --shell cmd host 'C:\path\x.cmd'`）
+    printf '%s\n' "$1" | awk '{ sub(/\r$/, "") } NF == 0 { next } { if (n++) printf " & "; printf "%s", $0 }'
+}
+
+ps_wrap_cmd() {
+    # $1 = cmd.exe 命令文本；输出在 PowerShell 里执行它的代码（单引号加倍）
+    _esc=$(printf '%s' "$(cmd_flatten "$1")" | sed "s/'/''/g")
+    printf "& cmd.exe /d /c '%s'" "$_esc"
+}
+
+# ---- 默认解释器探测 -------------------------------------------------------
+
+detect_shell() {
+    # 成功时输出 pwsh|ps5|cmd 并写缓存；失败 return 1
+    _sf="$HOME/.cache/wsh/$host.shell"
+    if [ -f "$_sf" ]; then
+        _k=$(cat "$_sf" 2>/dev/null)
+        case "$_k" in
+            pwsh|ps5|cmd) printf '%s\n' "$_k"; return 0 ;;
+        esac
+    fi
+    _ver=$(timeout 30 ssh -T -o ConnectTimeout=10 "$host" '$PSVersionTable.PSVersion.Major' 2>/dev/null) || _ver=""
+    case "$_ver" in
+        7*) _k=pwsh ;;
+        5*|4*|3*|2*) _k=ps5 ;;
+        *)
+            # 不是 PowerShell：再确认是不是 cmd（ssh 到 POSIX 机也会落到这里，按透传处理）
+            _out=$(timeout 30 ssh -T -o ConnectTimeout=10 "$host" 'echo WSH_CMD_OK' 2>/dev/null) || _out=""
+            case "$_out" in
+                *WSH_CMD_OK*) _k=cmd ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+    mkdir -p "$HOME/.cache/wsh" 2>/dev/null
+    printf '%s\n' "$_k" > "$_sf" 2>/dev/null
+    rm -f "$HOME/.cache/wsh/$host" 2>/dev/null   # 旧版一次性探针文件
+    printf '%s\n' "$_k"
+}
+
+# ---- 参数 ----------------------------------------------------------------
+
 mode=arg
 use_sess=1
+shell_sel=auto
 [ "${WSH_DIRECT:-0}" = "1" ] && use_sess=0
 HELP="awk 'NR>1 && /^#/ {sub(/^# ?/,\"\"); print; next} NR>1 {exit}' \"\$0\""
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -f) mode=file; shift ;;
         -S|--sess) use_sess=1; shift ;;
         --direct|--no-sess) use_sess=0; shift ;;
+        --shell)
+            [ $# -ge 2 ] || { echo "wsh: --shell 需要参数（auto|pwsh|ps5|cmd）" >&2; exit 2; }
+            shell_sel=$2; shift 2 ;;
+        --shell=*) shell_sel=${1#--shell=}; shift ;;
+        --pwsh|--ps7) shell_sel=pwsh; shift ;;
+        --ps5|--powershell) shell_sel=ps5; shift ;;
+        --cmd) shell_sel=cmd; shift ;;
         -h|--help) eval "$HELP"; exit 0 ;;
         --) shift; break ;;
         -*) echo "wsh: 未知选项 $1" >&2; exit 2 ;;
         *) break ;;
     esac
 done
+
+case "$shell_sel" in
+    auto|pwsh|ps5|cmd) ;;
+    ps7|pwsh7|7) shell_sel=pwsh ;;
+    powershell|powershell5|ps51|5) shell_sel=ps5 ;;
+    cmd.exe) shell_sel=cmd ;;
+    *) echo "wsh: --shell 只接受 auto|pwsh|ps5|cmd（收到 $shell_sel）" >&2; exit 2 ;;
+esac
+
+# `wsh kind [--reset] <host>`
+if [ "${1:-}" = "kind" ]; then
+    shift
+    _reset=0
+    [ "${1:-}" = "--reset" ] && { _reset=1; shift; }
+    [ $# -ge 1 ] || { echo "wsh: kind 需要主机名" >&2; exit 2; }
+    host=$1
+    _sf="$HOME/.cache/wsh/$host.shell"
+    [ "$_reset" = 1 ] && { rm -f "$_sf" "$HOME/.cache/wsh/$host"; }
+    if [ -f "$_sf" ]; then
+        cat "$_sf"
+        exit 0
+    fi
+    detect_shell || { echo "wsh: 无法判断 $host 的默认 shell" >&2; exit 3; }
+    exit 0
+fi
 
 [ $# -ge 1 ] || { eval "$HELP"; exit 2; }
 host=$1; shift
@@ -128,8 +230,52 @@ case "$mode" in
         ;;
 esac
 
+# ---- 决定用哪个解释器执行 body -------------------------------------------
+
+def_kind=$(detect_shell) || {
+    echo "wsh: 无法判断 $host 的默认 shell（既不是 PowerShell 也不是 cmd）" >&2
+    echo "     可显式指定：wsh --shell cmd|pwsh|ps5 $host '<命令>'" >&2
+    echo "     若远端默认 shell 不是 pwsh，可在 Windows 上改回：" >&2
+    echo "       New-ItemProperty -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -Value 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' -PropertyType String -Force; Restart-Service sshd" >&2
+    exit 3
+}
+
+if [ "$shell_sel" = auto ]; then target=$def_kind; else target=$shell_sel; fi
+
+run_raw=0          # 1 = 直接把 body 当远端命令发（默认 shell 就是 cmd）
+ps_code=""         # target 是 PowerShell 家族时，要交给默认 shell 的 PS 代码
+
+case "$target" in
+    cmd)
+        if [ "$def_kind" = cmd ]; then
+            run_raw=1
+        else
+            ps_code=$(ps_wrap_cmd "$body")
+        fi
+        ;;
+    pwsh)
+        if [ "$def_kind" = pwsh ]; then
+            ps_code=$body
+        else
+            ps_code=$(mkcmd_ps pwsh.exe "$(printf '%s\n%s' "$PROLOGUE" "$body")")
+        fi
+        ;;
+    ps5)
+        if [ "$def_kind" = ps5 ]; then
+            ps_code=$body
+        else
+            ps_code=$(mkcmd_ps powershell.exe "$(printf '%s\n%s' "$PROLOGUE" "$body")")
+        fi
+        ;;
+esac
+
+# cmd 默认 shell 下 sess 的常驻 loop 是 PowerShell，用不了 → 回落一次性 ssh
+if [ "$run_raw" = 1 ] && [ "$use_sess" -eq 1 ]; then
+    echo "wsh: 远端默认 shell 是 cmd，sess 协议不支持，回落一次性 ssh" >&2
+    use_sess=0
+fi
+
 # --sess：交给常驻会话执行（协议、base64、退出码都由 sess 负责）
-# 没有 sess 可执行文件时自动回落到一次性 ssh，不报错
 if [ "$use_sess" -eq 1 ] && [ -n "$body" ]; then
     sess_bin=""
     for c in "$HOME/.local/bin/sess" /usr/local/bin/sess; do
@@ -139,27 +285,13 @@ if [ "$use_sess" -eq 1 ] && [ -n "$body" ]; then
         sess_bin=$(command -v sess 2>/dev/null || true)
     fi
     if [ -n "$sess_bin" ]; then
-        exec "$sess_bin" run "$host" "$body"
+        exec "$sess_bin" run "$host" "$ps_code"
     fi
     echo "wsh: 未找到 sess，回落一次性 ssh" >&2
 fi
 
-# 探一次：远端默认 shell 必须是 PowerShell，且 exit 码能透传
-cache_dir="$HOME/.cache/wsh"
-mkdir -p "$cache_dir" 2>/dev/null
-if [ ! -f "$cache_dir/$host" ]; then
-    timeout 30 ssh -T "$host" "& ([scriptblock]::Create('exit 42'))" >/dev/null 2>&1
-    if [ $? -ne 42 ]; then
-        cat >&2 <<'EOF'
-wsh: 远端默认 shell 不是 PowerShell（exit 码无法透传）。
-     在 Windows 上以管理员身份修正一次即可：
-       New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
-         -Value 'C:\Program Files\PowerShell\7\pwsh.exe' -PropertyType String -Force
-       Restart-Service sshd
-EOF
-        exit 3
-    fi
-    printf 'ps\n' > "$cache_dir/$host"
+if [ "$run_raw" = 1 ]; then
+    exec ssh -T "$host" "$(cmd_flatten "$body")"
 fi
 
-exec ssh -T "$host" "$(mkcmd "$(printf '%s\n%s\n%s\n' "$PROLOGUE" "$body" "$EPILOGUE")")"
+exec ssh -T "$host" "$(mkcmd "$(printf '%s\n%s\n%s\n' "$PROLOGUE" "$ps_code" "$EPILOGUE")")"

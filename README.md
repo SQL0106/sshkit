@@ -7,7 +7,7 @@
 sshkit 把这两件事一起解决了：
 
 - **`rsh`** —— Linux/POSIX 目标：命令本地 base64，远端解码执行，引号/换行/中文零转义；强制落到 bash（远端登录 shell 是 zsh 也不怕）。
-- **`wsh`** —— Windows 目标：脚本 base64 交给**默认 shell 本进程**执行，不嵌套子进程，退出码如实透传。
+- **`wsh`** —— Windows 目标：脚本 base64 交给**远端默认解释器**（pwsh / 5.1 / cmd 均可，可 `--shell` 切换）执行，退出码如实透传。
 - **`sess`** —— 常驻远端会话：`cd`、环境变量、函数跨命令保留，一条命令固定 ~45ms（Windows 从 400ms 降到 47ms）。
 - **`ssh-unlock`** —— 幂等解锁常驻 ssh-agent，口令只经环境变量过一遍，不落盘。
 
@@ -15,7 +15,7 @@ sshkit 把这两件事一起解决了：
 
 ```
 bin/rsh           POSIX 目标外壳（bash 语义 + base64 传输）
-bin/wsh           Windows 目标外壳（pwsh 语义 + base64 传输）
+bin/wsh           Windows 目标外壳（pwsh / 5.1 / cmd 三解释器 + base64 传输）
 bin/sess          常驻会话守护（每 host 一个 keeper + unix socket）
 bin/ssh-unlock    无交互解锁 ssh-agent
 systemd/ssh-agent.service
@@ -43,6 +43,7 @@ rsh --sess linux-host 'cd /var/log; pwd'   # 下一条命令仍在 /var/log
 | Linux 单条命令 | `rsh host '<cmd>'` | ~33 ms |
 | **Windows 任何命令** | **`wsh host '<pwsh>'`**（默认走 sess 常驻会话） | **~70-120 ms** |
 | Windows 强制一次性 ssh | `wsh --direct host '<pwsh>'` | 握手 0.4 s ～ 30 s |
+| Windows 换解释器（5.1 / cmd） | `wsh --shell ps5 host '<ps>'` / `wsh --shell cmd host '<cmd>'` | ps5 ~370 ms / cmd ~90 ms |
 | 需要保留 `cd`/env/函数（Linux） | `rsh --sess host '<cmd>'` | ~45 ms/条 |
 | 整段本地脚本 | `rsh -f host ./script.sh` / `wsh -f host ./script.ps1` | 一条命令 |
 | 交互登录 | `rsh host` / `wsh host` | — |
@@ -100,21 +101,33 @@ fi
 
 ## wsh
 
-前提：远端 OpenSSH Server 的默认 shell 已经是 PowerShell（Windows 10/11 装了 pwsh 7 即如此，用注册表 `DefaultShell` 设置）。
+前提：远端 OpenSSH Server 的默认 shell 可以是 **pwsh 7 / Windows PowerShell 5.1 / cmd.exe** 中的任意一种（注册表 `DefaultShell` 设置）。`wsh` 首次连接时自动探测并缓存，也可以显式切换解释器。
 
 ```sh
-wsh win-host '$PSVersionTable.PSVersion.ToString()'
+wsh win-host '$PSVersionTable.PSVersion.ToString()'   # 默认 shell（自动探测）
 wsh win-host 'Get-ChildItem C:\ | Select-Object -First 3'
 wsh -f win-host ./script.ps1
 wsh -f win-host - < ./script.ps1
 wsh --sess win-host '"cwd=" + (Get-Location).Path'
+
+wsh kind win-host                 # 探测远端默认解释器：pwsh / ps5 / cmd
+wsh kind --reset win-host         # 丢掉缓存重新探测
+wsh --shell ps5 win-host 'Get-WmiObject Win32_OperatingSystem'
+wsh --shell cmd win-host 'dir /b C:\'
+wsh --cmd win-host 'echo %COMPUTERNAME%'     # 等价写法
 ```
 
 远端收到的命令形如 `& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>'))))` —— 命令行里不含双引号，也不启动子进程。
 
-- **退出码**：尾部显式 `exit`，先看 `$?` 再看 `$LASTEXITCODE`，非零就原样回传。
+- **解释器**：`--shell auto|pwsh|ps5|cmd`（默认 auto = 跟随远端默认 shell）。别名：`--pwsh`/`--ps7`、`--ps5`/`--powershell`、`--cmd`。
+  - 目标 == 默认 shell → 本进程执行，最快（pwsh 约 70ms/条）。
+  - 跨解释器 → 起子进程：`pwsh.exe` / `powershell.exe -NoProfile -EncodedCommand <UTF-16LE base64>`，引号/换行/中文全免转义；代价是一次进程启动（ps5 约 +300ms，cmd 约 +20ms）。
+  - cmd 在 PowerShell 默认 shell 下包成 `& cmd.exe /d /c '<text>'`；默认 shell 本身就是 cmd 时直接发原文（此时 sess 不支持，自动回落一次性 ssh）。
+  - 子进程执行**不共享会话状态**（`cd`、`$env:` 不保留），要连续状态就整段写成 `-f` 脚本一次跑完。
+- **多行 cmd**：`cmd /c` 只执行第一条命令行，`wsh` 会自动把多行折成 ` & ` 连接（因此 `goto`/label 不可用）。
+- **退出码**：尾部显式 `exit`，先看 `$?` 再看 `$LASTEXITCODE`，非零就原样回传；cmd 走 `cmd /c` 的退出码。
 - **编码**：PS7 设 `$PSStyle.OutputRendering="PlainText"` 去掉 ANSI；5.1 才需要显式设 `[Console]::OutputEncoding`（PS7 本来就是 UTF-8，设一次要多花 ~280ms）。
-- **首连探测**：执行一次 `exit 42`，rc==42 才认为「默认 shell 是 PowerShell 且退出码可透传」，结果缓存在 `~/.cache/wsh/<host>`。
+- **解释器探测**：`$PSVersionTable.PSVersion.Major` → `7*`=pwsh、`5*`（及更老）=ps5；不是 PowerShell 再试 `echo` → cmd。结果缓存在 `~/.cache/wsh/<host>.shell`，`wsh kind [--reset] <host>` 可查/重探。探测失败会打印两行诊断（含 `DefaultShell` 注册表修复命令）并 exit 3。
 - **本地 ssh-agent**：与 `rsh` 同一套——先内联 `ssh-add -l`（约 6ms），健康就不再 fork `ssh-unlock`（省约 25ms）；`rc=2`（socket 陈旧 / agent 已死）就地 `rm -f` + 重启 + 解锁，仍失败只在 **stderr 打一行**诊断。`SSH_AUTH_SOCK` 指向别的（转发）agent 时绝不删/重启。控制：`WSH_AGENT=auto|off`（默认 auto）、`WSH_NO_AGENT_FIX=1`。
 - **上限**：base64 后约 20KB（Windows 命令行长度限制）。更大的脚本先 scp 上去。
 
@@ -264,7 +277,9 @@ Host *
   - 没有 `systemctl --user`、没有 `sudo`：agent 前导只在 socket/unit 存在时才动手，此处两者都无 → 命中 `git` 等关键字时**静默跳过**；`rsh -s` 会得到 `sudo: inaccessible or not found`（rc 127），这是环境缺失，不是 `rsh` 的问题。
   - `$HOME/.local/bin` 一般不存在 → PATH 前导自然空转（该分支已用 `env -i` 隔离验证过）。
 - **macOS**：未实测。前导只用 POSIX 内建 + `ssh-add` + `sleep`，不依赖 `/proc`，理论上可跑。
-- **Windows**：`wsh` 的本地 agent 块已在本机验证（含真死自愈），但 `--sess` / `-f` / `--direct` 发到真实 Windows 的路径在开发时**未实测**（目标机全程离线）。
+- **Windows（Windows 10 19044 + pwsh 7.6.9 + 5.1.19041）**：`wsh` 已实测 —— 默认（pwsh/sess）、`--shell ps5`、`--shell cmd`、`--pwsh`、`-f`/`-f -`、`--direct`、退出码透传（含 cmd `exit /b`）、引号与中文、`wsh kind` 探测/缓存/`--reset` 全部正常。
+  - 单条耗时：默认 pwsh 66～96 ms，cmd 85～98 ms，ps5 332～408 ms（进程启动开销），`--direct` 约 0.7 s。
+  - 已知限制：sess 模式下命令里 `exit` 会杀掉常驻 shell（rc=255，下次自动重建）；跨解释器执行不保留 `cd`/`$env:`；多行 cmd 会被折叠成 ` & `（`goto`/label 不可用）。
 
 ## 故障排查
 
@@ -276,7 +291,7 @@ Host *
 | `cd`/环境变量「莫名丢失」 | 曾有多个 keeper 抢同一 socket（已用 pid 文件 + `flock` 修掉）；确认 `sess list` 里同一 host 只有一个 pid |
 | `sess run` 报 `No route to host` | 对端机器没开机/不在网，不是工具问题；`ping` 验证 |
 | 中文乱码 | Windows 端确认 `$PSStyle.OutputRendering`/编码设置；Linux 端确认 `LANG` |
-| `wsh` 首连报「默认 shell 不是 PowerShell」 | 远端 `DefaultShell` 指向 `cmd.exe` 或 5.1；改成 pwsh 7 的绝对路径后重试 |
+| `wsh` 报「无法判断 <host> 的默认 shell」 | 远端 `DefaultShell` 不可用或 OpenSSH 不通；`wsh kind --reset <host>` 重探，或直接 `wsh --shell cmd\|ps5\|pwsh` 指定解释器 |
 | 远端 `sess: command not found` | 老版本的 PATH 不含 `~/.local/bin`；本版非 `-n` 模式已自动前置，仍找不到就确认远端确实存在 `~/.local/bin` |
 | 远端 `git`/`ssh` 报 `Permission denied (publickey)` | 远端 ssh-agent 死了而 `~/.ssh/agent.sock` 仍是个陈旧 socket。`rsh` 在命令涉及 git/ssh 时会自动修（见上文）；被 `RSH_AGENT=off` / `RSH_NO_AGENT_FIX=1` 关掉时手工：`rm -f ~/.ssh/agent.sock && systemctl --user restart ssh-agent && ssh-unlock` |
 | `rsh -s` 报「只支持单条命令」 | 复合命令（`;` `&&` `|`）改用 `rsh -f <host> <脚本>`，在脚本里自己写 `sudo -n` |
@@ -286,7 +301,7 @@ Host *
 ```
 ~/.cache/sess/<host>.v3.{sock,pid,kind,log}   keeper 的 socket / pid / 类型 / 日志
 ~/.cache/sess/<host>.{sig,lock}               源码指纹、启动互斥锁
-~/.cache/wsh/<host>                           wsh 首连探测结果
+~/.cache/wsh/<host>.shell                   wsh 探测到的远端默认解释器（pwsh|ps5|cmd）
 ~/.ssh/cm/<hash>                              ControlMaster 复用 socket
 ```
 

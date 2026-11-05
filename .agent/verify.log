@@ -126,3 +126,17 @@ syntax: dash -n / bash -n OK；sh bin/wsh -h 5ms（帮助含 WSH_AGENT=auto|off�
 - agent 前导：`rsh realme 'git --version'` 命中正则但无 socket/unit → 静默跳过，stderr 仅 35B（命令自身的 sh: git not found），无 rsh 诊断噪声；`echo hi` stderr 0B
 - `rsh -s realme 'id -u'` → rc=127 `sudo: inaccessible or not found`（Android 无 sudo，环境缺失非缺陷）
 - 计时 10 次 `rsh realme 'echo hi'`：min 69ms / med 96ms / max 173ms（判据 <500ms）
+
+## 第 26 节 wsh 多解释器（探测 / 切换 / cmd 多行折叠）（2026-11-05）
+
+环境：win = 192.168.1.199，Windows 10 19044.7807，pwsh 7.6.9，Windows PowerShell 5.1.19041.7802。
+
+- 语法：`dash -n bin/wsh` / `bash -n bin/wsh` 通过；`sh bin/wsh -h` 输出含 `--shell` / `kind` 用法。
+- 探测：`rm -f ~/.cache/wsh/win.shell` 后 `sh bin/wsh kind win` → `pwsh`，0.492s（首次）；再跑 0.003s（缓存）；`kind --reset win` 重探 → `pwsh`。
+- 切换：默认 `auto:7.6.9`；`--shell ps5` → `ps5:5.1.19041.7802`；`--shell cmd` → `cmd-ok` + `Microsoft Windows [Version 10.0.19044.7807]`；`--shell pwsh` → `pwsh:7`。
+- 退出码：`--shell cmd 'exit /b 7'` → 7；`--shell ps5 'exit 5'` → 5；`--direct` 下 pwsh `exit 3`→3、cmd `exit /b 9`→9、ps5 `exit 4`→4；sess 下 `exit 3` → 255（杀 keeper，已知 sess 限制，下一条自动重建）。
+- 引号/中文：`--shell cmd "echo it's ok"` → `it's ok`；`-f` ps 脚本 → `中文测试`；`--shell ps5 'Write-Output "中文 ps5"'`、`--shell cmd 'echo 中文 cmd'` 均正常。
+- 文件/stdin：`-f win .agent/wsh-f-ps.ps1`（pwsh）、`-f --shell ps5`、`-f --shell cmd .agent/wsh-f-cmd.cmd`、`printf ... | wsh -f win -` 全部通过。
+- 修掉的 bug：`cmd /d /c '<多行>'` 只执行第一条命令行（`@echo off` 时零输出）→ 新增 `cmd_flatten()` 折成 ` & `，`ps_wrap_cmd` 与 direct raw cmd 分支都使用；修后多行 `line1`/`line2` 正常、`-f --shell cmd` → `file-cmd` + `中文测试`。
+- 性能（6 次）：auto(pwsh,sess) 66/68/71/79/88/96 ms；`--shell cmd`(sess) 85/87/90/91/94/98 ms；`--shell ps5`(sess) 332/340/362/377/408/408 ms；`--direct` 687/694/705/725/732/755 ms。
+- 遗留：跨解释器执行不保留 `cd`/`$env:`；多行 cmd 折叠后 `goto`/label 不可用；sess 下 `exit` → 255。
