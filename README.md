@@ -62,7 +62,7 @@ rsh host 'uname -a'                   # 远端强制 bash --noprofile --norc 解
 rsh host                              # 交互，exec bash -l
 rsh -f host ./script.sh               # 本地脚本喂远端 bash -s，零转义
 printf 'ls -l' | rsh -f host -        # 同上，从 stdin 读
-rsh -s host 'journalctl -n 20'        # 用户命令前加 sudo -n（配 NOPASSWD 子集）
+rsh -s host 'journalctl -n 20'        # 用户命令前加 sudo -n（只接受单条命令，配 NOPASSWD 子集）
 rsh -n host 'echo $ZSH_VERSION'       # 不改 shell，用远端原生 zsh/sh
 rsh --sess host 'cd /etc; pwd'        # 走常驻会话
 rsh --sess -f host ./script.sh        # 整段脚本送进常驻会话
@@ -78,7 +78,21 @@ else
 fi
 ```
 
-所以**永远不存在「本地删一层引号、远端再删一层」的问题**，远端没有 bash 会自动退回 sh。`-s` 是把 `sudo -n ` 直接贴在用户命令前面（不是 `sudo -n bash -c` —— sudoers 按命令路径授权，那样请求必然失败）。
+所以**永远不存在「本地删一层引号、远端再删一层」的问题**，远端没有 bash 会自动退回 sh。
+
+`-s` 是把 `sudo -n ` 直接贴在用户命令前面（不是 `sudo -n bash -c` —— sudoers 按命令路径授权，那样请求必然失败）。因此 `-s` 只接受**单条命令**：出现未转义的 `;`、`&&`、`|` 或换行会直接 `exit 2` 并提示改用 `rsh -f`（脚本里自己写 `sudo -n`）。旧版对复合命令只给第一段加 sudo，`sudo: a password is required` 会和后续输出混在一起，极易误判 —— 这个模糊行为已删除。`find ... \;` 里的转义分号仍放行。
+
+远端还有两件事在同一条远端命令里顺带处理（**不增加 ssh 往返**）：
+
+- **PATH**：非 `-n` 模式把 `$HOME/.local/bin`（存在时）前置到 PATH，自己装的工具不再 `command not found`。`-n` 保持远端原生 shell 语义不动。
+- **ssh-agent 自愈**：命令文本涉及 `git` / `ssh` / `scp` / `sftp` / `rsync` 时，先跑一次 `ssh-add -l`（约 +10 ms）：
+  - rc=0：agent 已就绪，直接放行；
+  - rc=1：agent 活着但没身份 → 调 `~/.local/bin/ssh-unlock`，必要时借 `bash -ic` 从登录环境取 `SSH_PASS` 再解锁；
+  - rc=2：socket 陈旧 / agent 已死 → `rm -f` 陈旧 socket → `systemctl --user restart ssh-agent`（无 systemd 时 `ssh-agent -a`）→ 等 agent 起来再解锁。
+
+  失败一律静默降级（命令照常执行），只在 stderr 打一行可诊断提示。开关：`RSH_AGENT=auto|always|off`（默认 `auto`；`off` 表示本地远端都不碰），`RSH_NO_AGENT_FIX=1` 彻底关闭。口令只存在于远端登录环境，从不进命令行、不落盘。指向转发 agent 的 `SSH_AUTH_SOCK` 绝不删除或重启。
+
+这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
 
 ## wsh
 
@@ -97,6 +111,7 @@ wsh --sess win-host '"cwd=" + (Get-Location).Path'
 - **退出码**：尾部显式 `exit`，先看 `$?` 再看 `$LASTEXITCODE`，非零就原样回传。
 - **编码**：PS7 设 `$PSStyle.OutputRendering="PlainText"` 去掉 ANSI；5.1 才需要显式设 `[Console]::OutputEncoding`（PS7 本来就是 UTF-8，设一次要多花 ~280ms）。
 - **首连探测**：执行一次 `exit 42`，rc==42 才认为「默认 shell 是 PowerShell 且退出码可透传」，结果缓存在 `~/.cache/wsh/<host>`。
+- **本地 ssh-agent**：与 `rsh` 同一套——先内联 `ssh-add -l`（约 6ms），健康就不再 fork `ssh-unlock`（省约 25ms）；`rc=2`（socket 陈旧 / agent 已死）就地 `rm -f` + 重启 + 解锁，仍失败只在 **stderr 打一行**诊断。`SSH_AUTH_SOCK` 指向别的（转发）agent 时绝不删/重启。控制：`WSH_AGENT=auto|off`（默认 auto）、`WSH_NO_AGENT_FIX=1`。
 - **上限**：base64 后约 20KB（Windows 命令行长度限制）。更大的脚本先 scp 上去。
 
 Windows 端**不需要 Git Bash**，也**不要**用 `ssh win-host 'powershell -Command ...'`：嵌套子进程的退出码会被吞成 1。
@@ -206,7 +221,9 @@ Host *
 | `sess run` 报 `No route to host` | 对端机器没开机/不在网，不是工具问题；`ping` 验证 |
 | 中文乱码 | Windows 端确认 `$PSStyle.OutputRendering`/编码设置；Linux 端确认 `LANG` |
 | `wsh` 首连报「默认 shell 不是 PowerShell」 | 远端 `DefaultShell` 指向 `cmd.exe` 或 5.1；改成 pwsh 7 的绝对路径后重试 |
-| 远端 `sess: command not found` | `rsh` 远端跑 `bash --noprofile --norc`，PATH 不含 `~/.local/bin` → 用绝对路径，或装到 `/usr/local/bin` |
+| 远端 `sess: command not found` | 老版本的 PATH 不含 `~/.local/bin`；本版非 `-n` 模式已自动前置，仍找不到就确认远端确实存在 `~/.local/bin` |
+| 远端 `git`/`ssh` 报 `Permission denied (publickey)` | 远端 ssh-agent 死了而 `~/.ssh/agent.sock` 仍是个陈旧 socket。`rsh` 在命令涉及 git/ssh 时会自动修（见上文）；被 `RSH_AGENT=off` / `RSH_NO_AGENT_FIX=1` 关掉时手工：`rm -f ~/.ssh/agent.sock && systemctl --user restart ssh-agent && ssh-unlock` |
+| `rsh -s` 报「只支持单条命令」 | 复合命令（`;` `&&` `|`）改用 `rsh -f <host> <脚本>`，在脚本里自己写 `sudo -n` |
 
 状态与缓存：
 

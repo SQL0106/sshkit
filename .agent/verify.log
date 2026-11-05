@@ -1,0 +1,113 @@
+== 1. 语法
+sh -n OK (dash/bash)
+== 2. 本机耗时
+  rsh server echo: 91 ms
+  rsh server echo: 53 ms
+  rsh server echo: 61 ms
+== 3. B: 远端 PATH
+/home/SQL916/.local/bin:/usr/local/bin:/usr/bin
+== 4. C: 单条（NOPASSWD 命令）
+bash:
+  rc=0
+  fedora 单条(需密码→明确报错):
+sudo: a password is required
+== 5. C: 复合（应 exit 2）
+  rc=2
+== 6. -f / -f - / --sess / -n
+home=/home/SQL916
+stdin-ok
+sess-ok
+native-ok
+== 7. 远端 agent 真死 → 一次调用自愈
+256 SHA256:YmRtg6Xa/TLm+p5xs+FpvM7RgTClGNHWiYH8cZsHFRc u0_a370@localhost (ED25519)
+  heal: 685 ms
+8895c8cbb79cee0f35bfacec96edd0d9dfa83edc	HEAD
+  git after heal: 4483 ms
+== 8. 本地 agent 自愈
+256 SHA256:YmRtg6Xa/TLm+p5xs+FpvM7RgTClGNHWiYH8cZsHFRc u0_a370@localhost (ED25519)
+
+######## 2026-11-05 21:51 第二段补测（fedora/win/realme 全离线，改用 server=本机 作远端） ########
+# 复跑命令：bash .agent/verify2.sh   （输出同时落 .agent/verify2.out）
+== 9. 目标可达性（复测时间 2026-11-05 21:50:39）
+  ping 192.168.1.200 -> rc=1
+  ping 192.168.1.199 -> rc=1
+  ping 192.168.1.100 -> rc=1
+  fedora tailscale 100.83.106.80 -> rc=1
+  fedora/win/realme 均不可达 → 演练改在同机 server(192.168.1.190) 上做，远端前导代码路径相同
+== 10. 计时（12 次，取 min/median；判据 <500ms）
+  旧 rsh server echo          min=34ms med=46ms
+  新 rsh server echo          min=38ms med=50ms
+  旧 rsh server $(普通 git) min=36ms med=47ms
+  新 rsh server $(普通 git) min=51ms med=61ms
+== 11. -f（含引号/管道）
+  file-mode-quote: [a b 'c']
+  PIPE A B 'C'
+  home=/home/SQL916
+== 12. -f -（stdin）
+  stdin-ok
+  [a b]
+== 13. --sess（含状态保持）
+  sess-pwd=/usr
+  next-pwd=/usr
+== 14. --sess -f
+  PIPE A B 'C'
+  home=/home/SQL916
+== 15. -n（原生 shell，不加 PATH 前导）
+  ssh 裸连         : zsh /home/SQL916/.local/bin:/home/SQL916/.opencode/bin:/usr/local/bin:/usr/bin:/bin:/usr/games
+  rsh -n           : zsh /home/SQL916/.local/bin:/home/SQL916/.opencode/bin:/usr/local/bin:/usr/bin:/bin:/usr/games
+  ssh + bash --norc: bash /home/SQL916/.local/bin:/home/SQL916/.opencode/bin:/usr/local/bin:/usr/bin:/bin:/usr/games
+  rsh（非 -n）     : bash /home/SQL916/.local/bin:/home/SQL916/.opencode/bin:/usr/local/bin:/usr/bin:/bin:/usr/games
+  → -n 与裸 ssh 完全一致；非 -n 的 bash 只有 /usr/local/bin:/usr/bin，靠前导补上 ~/.local/bin
+== 16. 健康态 stderr 字节数（应为 0）
+  cmd=[echo hi] stderr=0B
+  cmd=[ssh-add -l >/dev/null] stderr=0B
+  cmd=[git --version >/dev/null] stderr=0B
+== 17. 远端 agent 真死 → 一次调用自愈（同机 server；本地块先修，等价于真实两端场景的端到端验收）
+  256 SHA256:YmRtg6Xa/TLm+p5xs+FpvM7RgTClGNHWiYH8cZsHFRc u0_a370@localhost (ED25519)
+  heal: 236 ms
+  8895c8cbb79cee0f35bfacec96edd0d9dfa83edc	HEAD
+  git after heal: 1441 ms
+== 18. 远端前导独立演练（RSH_NO_AGENT_FIX=1 关掉内置修复，手工跑 bin/rsh 里那段前导）
+  抽取到的前导：35 行，末行：unset _rsh_sock _rsh_rc _rsh_broke _rsh_w _rsh_persist
+  断开后 ssh-add -l（本地直连）= rc=2
+  256 SHA256:YmRtg6Xa/TLm+p5xs+FpvM7RgTClGNHWiYH8cZsHFRc u0_a370@localhost (ED25519)
+  远端前导自愈: 275 ms
+  再看健康态（同一前导，应静默）:
+    stderr=0B
+== 19. 开关
+  RSH_NO_AGENT_FIX=1 → unit=failed ssh-add -l rc=2
+  RSH_AGENT=off      → unit=failed ssh-add -l rc=2
+  RSH_AGENT=always   → unit=active ssh-add -l rc=0，242 ms
+  恢复健康态后再测: 256 SHA256:YmRtg6Xa/TLm+p5xs+FpvM7RgTClGNHWiYH8cZsHFRc u0_a370@localhost (ED25519)
+== 20. 空命令 / -f 不存在 / -s 语义
+  空命令 rc=0
+  rsh: 读不到 .agent/__no_such_file
+  rc=2
+  -s 单条 NOPASSWD rc=0
+  -s 复合 rc=2
+  -s 转义分号 rc=1（非 2 = 未守卫拒绝；sudo 层是否允许另一回事）
+== 21. 跳过项
+  fedora 演练：LAN/Tailscale 均不可达（tailscale 显示 offline, last seen 1m ago）→ 跳过；同一代码路径已在 server 上验证
+  realme：LAN 192.168.1.100 FAILED、Tailscale offline 2d → 跳过
+  win：LAN 192.168.1.199 不可达（tailscale offline 21h）→ wsh 实测跳过
+
+== 22. PATH 前导隔离验证（本机 server 的 zsh 自带 ~/.local/bin，无法在链路里区分，故单独跑前导）
+  1) PATH 无 .local/bin: /home/SQL916/.local/bin:/usr/local/bin:/usr/bin
+  2) PATH 已含     : /home/SQL916/.local/bin:/usr/bin
+  3) HOME 不存在   : /usr/bin
+
+== 结论 ==
+  · 计时无退化：新 rsh server echo min38/med50ms（旧 34/46），判据 <500ms 通过；探测开销 +10~15ms 只在命令含 git/ssh 时发生
+  · -f / -f - / --sess / --sess -f / -n / 健康态 stderr=0B 全通过
+  · 远端 agent 真死后一次调用自愈（217~236ms），随后 git ls-remote 成功
+  · 远端前导单独演练（RSH_NO_AGENT_FIX=1 + 手工跑前导）自愈 275ms，健康态静默 0B
+  · 开关语义已修正：RSH_AGENT=off 原先仍跑本地块（会 ssh-unlock），现本地远端都不碰；三者实测 unit/rc 均符合预期
+  · fedora/win/realme 因离线跳过，同一代码路径已在 server 上验证
+
+=== 2026-11-05 22:0x 第23节 wsh 本地 agent 探测/自愈（win 离线，用 127.0.0.1 验证本地块 + 直连路径，不含 PowerShell 侧） ===
+syntax: dash -n / bash -n OK；sh bin/wsh -h 5ms（帮助含 WSH_AGENT=auto|off、WSH_NO_AGENT_FIX=1）
+真死(unit stop + rm socket) -> 一次 WSH_DIRECT=1 wsh 127.0.0.1：257ms 自愈，ssh-add -l 列出 ED25519，无诊断行（stderr 只有预期的 PowerShell 探针报错 rc=3）
+诊断行验证：SSH_AUTH_SOCK=/nonexistent -> 打印 'wsh: 本地 ssh-agent 无可用身份（socket=/nonexistent/agent.sock）...' 且不误删真实 socket（unit 仍 active）
+开关：WSH_AGENT=off / WSH_NO_AGENT_FIX=1 -> 均不自愈（sock=none unit=failed）
+开销（6 次 min/med，含到 127.0.0.1 的一次性 ssh 探针）：健康 31/38ms vs WSH_AGENT=off 24/26ms -> 探测 +7~12ms
+跳过：win 离线 21h（192.168.1.199 / ts 100.74.19.78），无法实测 wsh win 'echo hi' 与 $PSVersionTable；--sess/-f 依赖 sess 到 win，同样跳过

@@ -1,0 +1,236 @@
+[0m
+> build · deepseek-flash
+我先按顺序阅读必需的文档，并检查当前状态。
+[0m→ [0mRead .agent/rsh-fix.md 
+[0m→ [0mRead AGENTS.md 
+> build · deepseek-flash
+[0m→ [0mRead bin/rsh 
+[0m$ [0mcd /home/SQL916/sshkit && git status --short && echo "---" && git log --oneline -3 && echo "---" && ls -la .agent/
+M AGENTS.md
+ M README.md
+ M bin/rsh
+?? .agent/
+---
+8895c8c sess: 陈旧 keeper 自愈（1.5s 探活 + SIGKILL 重建）+ ssh 保活，冻结场景 40s→2.2s
+8c5515d wsh: 恢复 sess 默认（实测 70-120ms；147s 是陈旧 keeper，sess stop 即恢复），规则写明诊断三步
+a5db529 wsh: 默认改回一次性 ssh（sess keeper respawn 时实测 147s 比直连还慢），补硬规则与反例记录
+---
+总计 64
+drwxr-xr-x 2 SQL916 xo 4096 11月 5日 21:47 .
+drwxr-xr-x 6 SQL916 xo 4096 11月 5日 21:33 ..
+-rw-r--r-- 1 SQL916 xo 1962 11月 5日 21:39 agent_prelude.sh
+-rw-r--r-- 1 SQL916 xo  730 11月 5日 21:40 bench5.sh
+-rw-r--r-- 1 SQL916 xo  185 11月 5日 21:47 next-session.log
+-rw-r--r-- 1 SQL916 xo 3264 11月 5日 21:47 next-session-prompt.md
+-rw-r--r-- 1 SQL916 xo  142 11月 5日 21:37 path_prelude.sh
+-rw-r--r-- 1 SQL916 xo 8645 11月 5日 21:43 rsh-fix.md
+-rwxr-xr-x 1 SQL916 xo 4682 11月 5日 21:35 rsh.old
+-rw-r--r-- 1 SQL916 xo  119 11月 5日 21:37 t-f.sh
+-rw-r--r-- 1 SQL916 xo  179 11月 5日 21:40 t-git.sh
+-rw-r--r-- 1 SQL916 xo  761 11月 5日 21:42 verify.log
+-rwxr-xr-x 1 SQL916 xo 1563 11月 5日 21:42 verify.sh
+> build · deepseek-flash
+[0m→ [0mRead .agent/verify.sh 
+[0m→ [0mRead .agent/verify.log 
+> build · deepseek-flash
+[0m$ [0mcd /home/SQL916/sshkit && git diff --stat && echo "---README---" && git diff README.md | head -80
+AGENTS.md |   6 ++-
+ README.md |  22 ++++++--
+ bin/rsh   | 179 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 185 insertions(+), 22 deletions(-)
+---README---
+diff --git a/README.md b/README.md
+index 0495431..7b1d265 100644
+--- a/README.md
++++ b/README.md
+@@ -62,7 +62,7 @@ rsh host 'uname -a'                   # 远端强制 bash --noprofile --norc 解
+ rsh host                              # 交互，exec bash -l
+ rsh -f host ./script.sh               # 本地脚本喂远端 bash -s，零转义
+ printf 'ls -l' | rsh -f host -        # 同上，从 stdin 读
+-rsh -s host 'journalctl -n 20'        # 用户命令前加 sudo -n（配 NOPASSWD 子集）
++rsh -s host 'journalctl -n 20'        # 用户命令前加 sudo -n（只接受单条命令，配 NOPASSWD 子集）
+ rsh -n host 'echo $ZSH_VERSION'       # 不改 shell，用远端原生 zsh/sh
+ rsh --sess host 'cd /etc; pwd'        # 走常驻会话
+ rsh --sess -f host ./script.sh        # 整段脚本送进常驻会话
+@@ -78,7 +78,21 @@ else
+ fi
+ ```
+ 
+-所以**永远不存在「本地删一层引号、远端再删一层」的问题**，远端没有 bash 会自动退回 sh。`-s` 是把 `sudo -n ` 直接贴在用户命令前面（不是 `sudo -n bash -c` —— sudoers 按命令路径授权，那样请求必然失败）。
++所以**永远不存在「本地删一层引号、远端再删一层」的问题**，远端没有 bash 会自动退回 sh。
++
++`-s` 是把 `sudo -n ` 直接贴在用户命令前面（不是 `sudo -n bash -c` —— sudoers 按命令路径授权，那样请求必然失败）。因此 `-s` 只接受**单条命令**：出现未转义的 `;`、`&&`、`|` 或换行会直接 `exit 2` 并提示改用 `rsh -f`（脚本里自己写 `sudo -n`）。旧版对复合命令只给第一段加 sudo，`sudo: a password is required` 会和后续输出混在一起，极易误判 —— 这个模糊行为已删除。`find ... \;` 里的转义分号仍放行。
++
++远端还有两件事在同一条远端命令里顺带处理（**不增加 ssh 往返**）：
++
++- **PATH**：非 `-n` 模式把 `$HOME/.local/bin`（存在时）前置到 PATH，自己装的工具不再 `command not found`。`-n` 保持远端原生 shell 语义不动。
++- **ssh-agent 自愈**：命令文本涉及 `git` / `ssh` / `scp` / `sftp` / `rsync` 时，先跑一次 `ssh-add -l`（约 +10 ms）：
++  - rc=0：agent 已就绪，直接放行；
++  - rc=1：agent 活着但没身份 → 调 `~/.local/bin/ssh-unlock`，必要时借 `bash -ic` 从登录环境取 `SSH_PASS` 再解锁；
++  - rc=2：socket 陈旧 / agent 已死 → `rm -f` 陈旧 socket → `systemctl --user restart ssh-agent`（无 systemd 时 `ssh-agent -a`）→ 等 agent 起来再解锁。
++
++  失败一律静默降级（命令照常执行），只在 stderr 打一行可诊断提示。开关：`RSH_AGENT=auto|always|off`（默认 `auto`），`RSH_NO_AGENT_FIX=1` 彻底关闭（连本地解锁也一并跳过）。口令只存在于远端登录环境，从不进命令行、不落盘。指向转发 agent 的 `SSH_AUTH_SOCK` 绝不删除或重启。
++
++这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
+ 
+ ## wsh
+ 
+@@ -206,7 +220,9 @@ Host *
+ | `sess run` 报 `No route to host` | 对端机器没开机/不在网，不是工具问题；`ping` 验证 |
+ | 中文乱码 | Windows 端确认 `$PSStyle.OutputRendering`/编码设置；Linux 端确认 `LANG` |
+ | `wsh` 首连报「默认 shell 不是 PowerShell」 | 远端 `DefaultShell` 指向 `cmd.exe` 或 5.1；改成 pwsh 7 的绝对路径后重试 |
+-| 远端 `sess: command not found` | `rsh` 远端跑 `bash --noprofile --norc`，PATH 不含 `~/.local/bin` → 用绝对路径，或装到 `/usr/local/bin` |
++| 远端 `sess: command not found` | 老版本的 PATH 不含 `~/.local/bin`；本版非 `-n` 模式已自动前置，仍找不到就确认远端确实存在 `~/.local/bin` |
++| 远端 `git`/`ssh` 报 `Permission denied (publickey)` | 远端 ssh-agent 死了而 `~/.ssh/agent.sock` 仍是个陈旧 socket。`rsh` 在命令涉及 git/ssh 时会自动修（见上文）；被 `RSH_AGENT=off` / `RSH_NO_AGENT_FIX=1` 关掉时手工：`rm -f ~/.ssh/agent.sock && systemctl --user restart ssh-agent && ssh-unlock` |
++| `rsh -s` 报「只支持单条命令」 | 复合命令（`;` `&&` `|`）改用 `rsh -f <host> <脚本>`，在脚本里自己写 `sudo -n` |
+ 
+ 状态与缓存：
+[0m$ [0mcd /home/SQL916/sshkit && ip neigh show 192.168.1.200 192.168.1.199 192.168.1.100 2>/dev/null; ping -c1 -W 0.3 -n 192.168.1.200 >/dev/null 2>&1; echo "fedora ping=$?"; ping -c1 -W 0.3 -n 192.168.1.199 >/dev/null 2>&1; echo "win ping=$?"; ping -c1 -W 0.3 -n 192.168.1.100 >/dev/null 2>&1; echo "realme ping=$?"
+192.168.1.100 dev wlp1s0 FAILED 
+fedora ping=1
+win ping=1
+realme ping=1
+> build · deepseek-flash
+[0m$ [0mcd /home/SQL916/sshkit && ip -4 addr show wlp1s0 2>/dev/null | head -5; ip route | head -5; ip neigh show 192.168.1.1 | head -3
+3: wlp1s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000
+    altname wlx00037f12535e
+    inet 192.168.1.190/24 brd 192.168.1.255 scope global noprefixroute wlp1s0
+       valid_lft forever preferred_lft forever
+default via 192.168.1.1 dev wlp1s0 proto static metric 600 
+172.16.0.0/16 dev usb0 proto kernel scope link src 172.16.42.1 linkdown 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+192.168.1.0/24 dev wlp1s0 proto kernel scope link src 192.168.1.190 metric 600 
+198.18.0.0/30 dev Meta proto kernel scope link src 198.18.0.1 
+192.168.1.1 dev wlp1s0 lladdr 44:a3:c7:86:c5:02 REACHABLE
+> build · deepseek-flash
+[0m$ [0mls ~/.ssh/cm/ 2>/dev/null | head; ssh -O check fedora 2>&1 | head -2
+28f3770f774bd7bb919d85e5457dd57d5799e5c1
+467e1623bbd4953555cde7f2ba01fee8e185957a
+7cec0add8e80de25da01e1b10a6c02155c02f433
+ea6aadce2dd27f83092ed36b705b8cb51d38dcbe
+f6445a9d34a52871e41e777f09c311d4a4f69dec
+Master running (pid=2353)
+> build · deepseek-flash
+[0m$ [0mcd /home/SQL916/sshkit && s=$(date +%s%N); bash bin/rsh fedora 'echo hi'; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e-s)/1000000 ))"
+Command moved to the background (shell ID: sh_1abf6fad700128WWl9i9O35Vz1).
+Output is streaming to: /home/SQL916/.local/share/opencode/shell/77dfe9ae242d3e4ec9cfb1945ba8ca2e1169ba02/sh_1abf6fad700128WWl9i9O35Vz1.out
+> build · deepseek-flash
+While that runs, let me read `bin/wsh` to plan the agent-self-heal port.
+[0m→ [0mRead bin/wsh 
+> build · deepseek-flash
+[0m← [0mEdit bin/wsh
+Index: bin/wsh
+===================================================================
+--- bin/wsh
++++ bin/wsh
+@@ -20,8 +20,12 @@
+ #   3) 输出编码强制 UTF-8（中文不乱码），吞掉 CLIXML / progress 噪声
+ #   4) 尾部显式 `exit`，所以 $LASTEXITCODE / 非终止错误都能变成真实退出码
+ #
+ # 注意：脚本上限约 20KB（Windows 命令行长度限制）。更大请先 scp 上去再执行。
++#
++# 本地 ssh-agent：先内联 `ssh-add -l` 判定（~6ms），健康就不再调 ssh-unlock（省 ~25ms）；
++# socket 陈旧 / agent 已死（rc=2）时就地 rm+重启+解锁，失败只在 stderr 打一行诊断。
++# 控制：WSH_AGENT=auto|off（默认 auto），WSH_NO_AGENT_FIX=1 彻底关闭。
+ 
+ set -u
+ 
+ PROLOGUE='$ProgressPreference="SilentlyContinue"
+
+> build · deepseek-flash
+[0m← [0mEdit bin/wsh
+Index: bin/wsh
+===================================================================
+--- bin/wsh
++++ bin/wsh
+@@ -52,12 +52,8 @@
+     b64=$(printf '%s' "$1" | base64 -w0)
+     printf '%s' "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64'))))"
+ }
+ 
+-if [ -x "$HOME/.local/bin/ssh-unlock" ]; then
+-    "$HOME/.local/bin/ssh-unlock" >/dev/null 2>&1 || true
+-fi
+-
+ mode=arg
+ use_sess=1
+ [ "${WSH_DIRECT:-0}" = "1" ] && use_sess=0
+ HELP="awk 'NR>1 && /^#/ {sub(/^# ?/,\"\"); print; next} NR>1 {exit}' \"\$0\""
+
+> build · deepseek-flash
+[0m← [0mEdit bin/wsh
+Index: bin/wsh
+===================================================================
+--- bin/wsh
++++ bin/wsh
+@@ -71,8 +71,45 @@
+ 
+ [ $# -ge 1 ] || { eval "$HELP"; exit 2; }
+ host=$1; shift
+ 
++# 本地 ssh-agent：健康时不 fork ssh-unlock（省 ~25ms），坏了就地自愈（与 rsh 同一套故障）。
++# 只碰「本机自己的常驻 agent」：SSH_AUTH_SOCK 指向转发 agent 时绝不删/重启。
++_wsh_agent=${WSH_AGENT:-auto}
++if [ "${WSH_NO_AGENT_FIX:-0}" != 1 ] && [ "$_wsh_agent" != off ] && command -v ssh-add >/dev/null 2>&1; then
++    _wsh_sock="$HOME/.ssh/agent.sock"
++    _wsh_rc=0
++    if [ -e "$_wsh_sock" ] || [ -f "$HOME/.config/systemd/user/ssh-agent.service" ]; then
++        if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -e "$_wsh_sock" ]; then
++            SSH_AUTH_SOCK=$_wsh_sock; export SSH_AUTH_SOCK
++        fi
++        ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
++    fi
++    if [ "$_wsh_rc" -eq 2 ] && { [ -z "${SSH_AUTH_SOCK:-}" ] || [ "$SSH_AUTH_SOCK" = "$_wsh_sock" ]; }; then
++        rm -f "$_wsh_sock"
++        if command -v systemctl >/dev/null 2>&1 && systemctl --user restart ssh-agent >/dev/null 2>&1; then :
++        elif command -v ssh-agent >/dev/null 2>&1; then ssh-agent -a "$_wsh_sock" >/dev/null 2>&1 || true
++        fi
++        SSH_AUTH_SOCK=$_wsh_sock; export SSH_AUTH_SOCK
++        ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
++        _wsh_w=0
++        while [ "$_wsh_rc" -eq 2 ] && [ "$_wsh_w" -lt 10 ]; do
++            sleep 0.1
++            ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
++            _wsh_w=$((_wsh_w + 1))
++        done
++    fi
++    if [ "$_wsh_rc" -ne 0 ] && [ -x "$HOME/.local/bin/ssh-unlock" ]; then
++        "$HOME/.local/bin/ssh-unlock" >/dev/null 2>&1 || true
++        ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
++    fi
++    if [ "$_wsh_rc" -ne 0 ] && { [ -e "$_wsh_sock" ] || [ -f "$HOME/.config/systemd/user/ssh-agent.service" ]; }; then
++        echo "wsh: 本地 ssh-agent 无可用身份（socket=${SSH_AUTH_SOCK:-未设置}），连接会 publickey 失败；修复: rm -f ~/.ssh/agent.sock && systemctl --user restart ssh-agent && ssh-unlock" >&2
++    fi
++    unset _wsh_sock _wsh_rc _wsh_w
++fi
++unset _wsh_agent
++
+ case "$mode" in
+     file)
+         src=${1:-}
+         [ -n "$src" ] || { echo "wsh: -f 需要脚本路径（用 - 表示 stdin）" >&2; exit 2; }
+
+> build · deepseek-flash
+[0m→ [0mRead /home/SQL916/.local/share/opencode/shell/77dfe9ae242d3e4ec9cfb1945ba8ca2e1169ba02/sh_1abf6fad700128WWl9i9O35Vz1.out 
+[0m$ [0mcd /home/SQL916/sshkit && dash -n bin/wsh && bash -n bin/wsh && echo "wsh syntax OK" && dash -n bin/rsh && bash -n bin/rsh && echo "rsh syntax OK" && bash bin/wsh -h | head -5
+wsh syntax OK
+rsh syntax OK
+wsh —— Windows 目标专用 ssh 外壳（要求远端默认 shell 是 PowerShell，win 上即 pwsh 7）
+
+用法：
+  wsh <host>                     # 交互登录
+  wsh <host> '<PowerShell 代码>'  # 执行（多行也行，本地绝不做引号解析）
+> build · deepseek-flash
+[0m$ [0mping -c1 -W 0.5 -n 100.83.106.80 >/dev/null 2>&1; echo "fedora ts ping=$?"; tailscale status 2>/dev/null | head -8
+fedora ts ping=1
+100.95.40.31    oneplus8           liuqiansheng090106@  linux    idle; offers exit node                                       
+100.105.243.7   desktop-11krpmj    liuqiansheng090106@  windows  offline, last seen 40d ago                                   
+100.75.190.29   desktop-61h3gtf    liuqiansheng090106@  windows  offline, last seen 159d ago                                  
+100.74.19.78    desktop-p972t83    liuqiansheng090106@  windows  offline, last seen 21h ago                                   
+100.83.106.80   fedora             liuqiansheng090106@  linux    active; relay "hkg"; offline, last seen 1m ago, tx 156 rx 0  
+100.102.64.119  realme-neo7-turbo  liuqiansheng090106@  android  offline, last seen 2d ago                                    
+
+# Health check:
+> build · deepseek-flash
+[0m$ [0mpkill -f "bin/rsh fedora" 2>/dev/null; ssh -O exit fedora 2>&1 | head -2; sleep 1; ping -c1 -W 0.5 -n 192.168.1.200 >/dev/null 2>&1; echo "fedora lan ping=$?"
+(no output)

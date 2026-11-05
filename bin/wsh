@@ -21,6 +21,10 @@
 #   4) 尾部显式 `exit`，所以 $LASTEXITCODE / 非终止错误都能变成真实退出码
 #
 # 注意：脚本上限约 20KB（Windows 命令行长度限制）。更大请先 scp 上去再执行。
+#
+# 本地 ssh-agent：先内联 `ssh-add -l` 判定（~6ms），健康就不再调 ssh-unlock（省 ~25ms）；
+# socket 陈旧 / agent 已死（rc=2）时就地 rm+重启+解锁，失败只在 stderr 打一行诊断。
+# 控制：WSH_AGENT=auto|off（默认 auto），WSH_NO_AGENT_FIX=1 彻底关闭。
 
 set -u
 
@@ -49,10 +53,6 @@ mkcmd() {
     printf '%s' "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64'))))"
 }
 
-if [ -x "$HOME/.local/bin/ssh-unlock" ]; then
-    "$HOME/.local/bin/ssh-unlock" >/dev/null 2>&1 || true
-fi
-
 mode=arg
 use_sess=1
 [ "${WSH_DIRECT:-0}" = "1" ] && use_sess=0
@@ -71,6 +71,43 @@ done
 
 [ $# -ge 1 ] || { eval "$HELP"; exit 2; }
 host=$1; shift
+
+# 本地 ssh-agent：健康时不 fork ssh-unlock（省 ~25ms），坏了就地自愈（与 rsh 同一套故障）。
+# 只碰「本机自己的常驻 agent」：SSH_AUTH_SOCK 指向转发 agent 时绝不删/重启。
+_wsh_agent=${WSH_AGENT:-auto}
+if [ "${WSH_NO_AGENT_FIX:-0}" != 1 ] && [ "$_wsh_agent" != off ] && command -v ssh-add >/dev/null 2>&1; then
+    _wsh_sock="$HOME/.ssh/agent.sock"
+    _wsh_rc=0
+    if [ -e "$_wsh_sock" ] || [ -f "$HOME/.config/systemd/user/ssh-agent.service" ]; then
+        if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -e "$_wsh_sock" ]; then
+            SSH_AUTH_SOCK=$_wsh_sock; export SSH_AUTH_SOCK
+        fi
+        ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
+    fi
+    if [ "$_wsh_rc" -eq 2 ] && { [ -z "${SSH_AUTH_SOCK:-}" ] || [ "$SSH_AUTH_SOCK" = "$_wsh_sock" ]; }; then
+        rm -f "$_wsh_sock"
+        if command -v systemctl >/dev/null 2>&1 && systemctl --user restart ssh-agent >/dev/null 2>&1; then :
+        elif command -v ssh-agent >/dev/null 2>&1; then ssh-agent -a "$_wsh_sock" >/dev/null 2>&1 || true
+        fi
+        SSH_AUTH_SOCK=$_wsh_sock; export SSH_AUTH_SOCK
+        ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
+        _wsh_w=0
+        while [ "$_wsh_rc" -eq 2 ] && [ "$_wsh_w" -lt 10 ]; do
+            sleep 0.1
+            ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
+            _wsh_w=$((_wsh_w + 1))
+        done
+    fi
+    if [ "$_wsh_rc" -ne 0 ] && [ -x "$HOME/.local/bin/ssh-unlock" ]; then
+        "$HOME/.local/bin/ssh-unlock" >/dev/null 2>&1 || true
+        ssh-add -l >/dev/null 2>&1; _wsh_rc=$?
+    fi
+    if [ "$_wsh_rc" -ne 0 ] && { [ -e "$_wsh_sock" ] || [ -f "$HOME/.config/systemd/user/ssh-agent.service" ]; }; then
+        echo "wsh: 本地 ssh-agent 无可用身份（socket=${SSH_AUTH_SOCK:-未设置}），连接会 publickey 失败；修复: rm -f ~/.ssh/agent.sock && systemctl --user restart ssh-agent && ssh-unlock" >&2
+    fi
+    unset _wsh_sock _wsh_rc _wsh_w
+fi
+unset _wsh_agent
 
 case "$mode" in
     file)

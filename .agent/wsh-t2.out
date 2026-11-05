@@ -1,0 +1,5 @@
+wsh: 远端默认 shell 不是 PowerShell（exit 码无法透传）。
+     在 Windows 上以管理员身份修正一次即可：
+       New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
+         -Value 'C:\Program Files\PowerShell\7\pwsh.exe' -PropertyType String -Force
+       Restart-Service sshd

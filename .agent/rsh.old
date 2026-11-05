@@ -1,0 +1,114 @@
+#!/bin/sh
+# rsh —— 给 agent/脚本用的 ssh 外壳（POSIX 目标：Linux / Android / macOS）
+#
+# 用法：
+#   rsh <host>                  # 交互登录（强制落到 bash -l）
+#   rsh <host> <cmd> [args...]  # 直接执行；强制用远端 bash 解析
+#   rsh -f <host> <本地脚本>     # 把脚本喂给远端 bash -s（免除一切引号/heredoc 地狱）
+#   rsh -f <host> -             # 从 stdin 读脚本
+#   rsh -s <host> <cmd>         # 用 sudo -n 执行
+#   rsh -n <host> ...           # native：不改 shell，用远端默认 shell（zsh/sh）
+#   rsh --sess <host> <cmd>     # 走 sess 常驻会话：cd/变量/函数跨命令保留（~45ms/条）
+#   rsh --sess -f <host> <脚本>  # 同上，脚本整段送进常驻会话
+#
+# 做的事：
+#   1) 调用 ssh-unlock 把密钥载入常驻 agent（失败静默，退回 askpass）
+#   2) 复用 ControlMaster 连接（第二条命令 ~0.05s）
+#   3) **强制 bash**：LLM 的默认知识是 bash，远端若把 zsh/sh 设成登录 shell，
+#      `rsh host 'cmd'` 会把命令交给 bash -c 而不是 zsh -c；命令本地 base64 编码，
+#      远端 `eval "$(printf %s B64 | base64 -d)"`，不经任何二次引号解析。
+#      远端没有 bash 时自动退回 sh。
+#   4) -f 模式：ssh host 'bash -s' < file —— 脚本里可以随便写引号、变量、管道
+
+set -u
+
+self=$(basename "$0")
+
+# 尽力解锁 agent；失败不阻塞（rc 里已导出 SSH_ASKPASS 兜底）
+if [ -x "$HOME/.local/bin/ssh-unlock" ]; then
+    "$HOME/.local/bin/ssh-unlock" >/dev/null 2>&1 || true
+fi
+
+mode=exec
+sudo_run=0
+native=0
+use_sess=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f) mode=file; shift ;;
+        -s) sudo_run=1; shift ;;
+        -n) native=1; shift ;;
+        -S|--sess) use_sess=1; shift ;;
+        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "$self: 未知选项 $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+[ $# -ge 1 ] || { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+host=$1; shift
+
+# 把一段脚本文本包成「远端强制 bash 执行」的命令串。
+# 打印到 stdout；调用方 exec ssh -T "$host" "$(wrap ...)"。
+wrap() {
+    b64=$(printf '%s' "$1" | base64 | tr -d '\n')
+    if [ "$native" -eq 1 ]; then
+        printf '%s' "eval \"\$(printf %s $b64 | base64 -d 2>/dev/null || printf %s $b64 | base64 -D)\""
+    else
+        printf '%s' "if command -v bash >/dev/null 2>&1; then bash --noprofile --norc -c 'eval \"\$(printf %s $b64 | base64 -d 2>/dev/null || printf %s $b64 | base64 -D)\"'; else sh -c 'eval \"\$(printf %s $b64 | base64 -d 2>/dev/null || printf %s $b64 | base64 -D)\"'; fi"
+    fi
+}
+
+if [ "$mode" = file ]; then
+    src=${1:-}
+    [ -n "$src" ] || { echo "$self: -f 需要脚本路径（用 - 表示 stdin）" >&2; exit 2; }
+    if [ "$sudo_run" -eq 1 ]; then
+        echo "$self: -f 模式下 -s 无效（脚本里请自己写 sudo -n）" >&2
+    fi
+    if [ "$use_sess" -eq 1 ]; then
+        if [ "$src" = "-" ]; then body=$(cat); else
+            [ -r "$src" ] || { echo "$self: 读不到 $src" >&2; exit 2; }
+            body=$(cat "$src")
+        fi
+        exec "$HOME/.local/bin/sess" run "$host" "$body"
+    fi
+    if [ "$native" -eq 1 ]; then
+        interp='sh -s'
+    else
+        interp='if command -v bash >/dev/null 2>&1; then exec bash --noprofile --norc -s; else exec sh -s; fi'
+    fi
+    if [ "$src" = "-" ]; then
+        exec ssh -T "$host" "$interp"
+    fi
+    [ -r "$src" ] || { echo "$self: 读不到 $src" >&2; exit 2; }
+    exec ssh -T "$host" "$interp" < "$src"
+fi
+
+if [ $# -eq 0 ]; then
+    if [ "$use_sess" -eq 1 ]; then
+        echo "$self: --sess 是非交互会话，交互请直接 $self $host" >&2
+        exit 2
+    fi
+    if [ "$native" -eq 1 ]; then
+        exec ssh -t "$host"
+    fi
+    # 交互：登录 bash（读 /etc/profile、~/.profile 等），避免在 zsh 里手敲 bash 语法
+    exec ssh -t "$host" 'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi'
+fi
+
+if [ "$use_sess" -eq 1 ]; then
+    # 常驻会话内部已是 bash，且 cd/变量跨命令保留；不再套 wrap（避免二次 base64）
+    if [ "$sudo_run" -eq 1 ]; then
+        exec "$HOME/.local/bin/sess" run "$host" "sudo -n $*"
+    fi
+    exec "$HOME/.local/bin/sess" run "$host" "$*"
+fi
+
+if [ "$sudo_run" -eq 1 ]; then
+    # sudoers 按「命令路径」授权，所以 sudo -n 必须贴着用户命令，不能包 bash。
+    # 注意：复合命令（a; b）只会给第一段加 sudo，复杂场景请自己在命令里写 sudo -n。
+    exec ssh -T "$host" "$(wrap "sudo -n $*")"
+fi
+
+exec ssh -T "$host" "$(wrap "$*")"
