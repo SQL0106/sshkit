@@ -105,9 +105,9 @@ fi
 
 这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
 
-### droidspaces 容器直连（容器没跑 sshd 时）
+### droidspaces 容器直连
 
-Android 设备上用 [droidspaces](https://github.com/ravindu644/Droidspaces-OSS) 跑 Linux 容器时，如果**容器自己没跑 sshd**，`rsh` 可以直接把命令送进容器，不用先在宿主 shell 里手打 `droidspaces run`。
+Android 设备上用 [droidspaces](https://github.com/ravindu644/Droidspaces-OSS) 跑 Linux 容器时，有两种进容器的方式：**容器自己跑了 sshd 就直连它的别名**（首选）；容器没跑 sshd 时，`rsh -C` 可以把命令送进容器，不用先在宿主 shell 里手打 `droidspaces run`。
 
 **默认 `rsh host` 永远停在宿主 shell**（Android 的 ksu/ksutools shell），不做任何探测；要进容器必须显式指定。三选一：
 
@@ -281,11 +281,13 @@ echo "$SSH_PASS"
 | `ssh win-host '1'`（profile 加非交互守卫前） | 1250 ms |
 | `sess run win-host '1'` | **47.2 ms（8.7×）** |
 | `wsh --sess win-host '1'` | 59.2 ms |
+| `rsh -C android-host true`（droidspaces 包装） | 90–92 ms |
+| `rsh ctr-host true`（容器自己的 sshd + ControlMaster） | ~90 ms |
 
 ## 安装
 
 ```sh
-./install.sh                     # 四个工具 → ${SSHKIT_BIN:-~/.local/bin}
+./install.sh                     # 五个工具 → ${SSHKIT_BIN:-~/.local/bin}
 ./install.sh --agent             # 外加 systemd user unit 并 enable --now
 SSHKIT_BIN=/usr/local/bin ./install.sh   # 换安装目录
 ```
@@ -315,7 +317,7 @@ Host *
 
 第一次要 `mkdir -p ~/.ssh/cm && chmod 700 ~/.ssh/cm`。
 
-卸载：删掉 `~/.local/bin/{rsh,wsh,sess,ssh-unlock}`，`systemctl --user disable --now ssh-agent`，再删 `~/.cache/sess`、`~/.cache/wsh`。
+卸载：删掉 `~/.local/bin/{rsh,rshc,wsh,sess,ssh-unlock}`，`systemctl --user disable --now ssh-agent`，再删 `~/.cache/sess`、`~/.cache/wsh`、`~/.cache/sshkit`。
 
 ## 远端要求
 
