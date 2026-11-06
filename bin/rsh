@@ -10,22 +10,27 @@
 #   rsh -n <host> ...           # native：不改 shell，用远端默认 shell（zsh/sh）
 #   rsh --sess <host> <cmd>     # 走 sess 常驻会话：cd/变量/函数跨命令保留（~45ms/条）
 #   rsh --sess -f <host> <脚本>  # 同上，脚本整段送进常驻会话
-#   rsh -H <host> <cmd>         # 直落宿主 shell，忽略容器映射/自动探测
-#   rsh -c <容器> <host> <cmd>  # 指定容器（跳过自动探测）
+#   rsh -C <host> <cmd>         # 进容器（包装模式）：映射或唯一容器，没有就报错
+#   rsh -c <容器> <host> <cmd>  # 进指定容器（包装模式）
+#   rsh -H <host> <cmd>         # 强制宿主 shell，忽略映射/RSH_CONTAINER
 #   rsh -R <host> <cmd>         # 强制重新探测 droidspaces/容器（忽略缓存）
 #   rsh containers <host>       # 显示该机的 droidspaces 与容器，并刷新缓存
 #
 # droidspaces 容器直连（Android/KernelSU）：
-#   容器里跑着 sshd 时**优先用它的 ssh 别名**（示例：rsh android-c，~/.ssh/config 里
-#   Port 22）——scp/sess/ControlMaster 全套语义都可用，rsh 不需要任何包装。
-#   容器没跑 sshd 时，用 droidspaces 包装模式落进容器：
-#     - 显式映射 ~/.config/sshkit/containers，每行：<host><空白><容器名>[<TAB><droidspaces路径>]
+#   **默认 `rsh <host>` 就是宿主 shell（例如 Android shell），不做任何探测。**
+#   要进容器，三选一：
+#     1) 容器自己跑着 sshd → 用它专门的 ssh 别名（首选，示例：rsh android-c，
+#        ~/.ssh/config 里 Port 22）——scp/sess/ControlMaster 全套语义都可用，零包装。
+#     2) `rsh -C <host> <cmd>` 包装进容器：有映射用映射，否则现探（只有一个容器才进）。
+#     3) `rsh -c '<容器名>' <host> <cmd>` 明确指定。
+#   映射文件 ~/.config/sshkit/containers，每行：<host><空白><容器名>[<TAB><droidspaces路径>]
 #         linux-host debian-13
 #         android-host  Debian 13<TAB>/data/local/Droidspaces/bin/droidspaces
-#       容器名可含空格（取到 TAB 或行尾），# 注释、空行忽略。
-#     - 没有映射就自动探测：远端有 droidspaces 且**只有一个**容器时自动进入，结果缓存
-#       在 ~/.cache/sshkit/<host>.container（-R 强制刷新；RSH_AUTODETECT=0 关闭）。
-#     - 有多个容器且没映射 → 列出候选并 exit 2（用 -c 或写映射文件）。
+#   容器名可含空格（取到 TAB 或行尾），# 注释、空行忽略。
+#   探测结果缓存在 ~/.cache/sshkit/<host>.container（-R 强制刷新）。
+#   有多个容器且没映射 → 列出候选并 exit 2（用 -c 或写映射文件）。
+#   旧行为（有 droidspaces 且只有一个容器就自动进）需要 RSH_AUTODETECT=1 才开启。
+#   宿主 shell（Android）用 `rsh <host>` 即可；-H 只是显式关掉映射/RSH_CONTAINER。
 #   命中后：
 #     rsh <host> <cmd>       → droidspaces -n '<容器>' run -- bash --noprofile --norc -c ...
 #     rsh -f <host> <脚本|->  → droidspaces -n '<容器>' run -- bash -s
@@ -96,6 +101,7 @@ use_sess=0
 host_shell=0
 refresh=0
 opt_container=""
+opt_ctr=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -f) mode=file; shift ;;
@@ -104,6 +110,7 @@ while [ $# -gt 0 ]; do
         -S|--sess) use_sess=1; shift ;;
         -H|--host-shell) host_shell=1; shift ;;
         -R|--refresh) refresh=1; shift ;;
+        -C|--ctr) opt_ctr=1; shift ;;
         -c|--container)
             [ $# -ge 2 ] || { echo "$self: -c 需要容器名" >&2; exit 2; }
             opt_container=$2; shift 2 ;;
@@ -213,50 +220,74 @@ print_container_list() {
     printf '%s\n' "$p_list" | awk -F'\t' '{ printf "  %-24s pid=%s\n", $1, $2 }'
 }
 
-if [ "$host_shell" -eq 0 ] && [ "${RSH_HOST_SHELL:-0}" != 1 ] && [ "$subcmd" != containers ]; then
-    if _m=$(container_lookup "$host"); then
+# 容器模式只在**显式请求**时启用：-C / -c / RSH_CONTAINER / RSH_AUTODETECT=1。
+# 裸 `rsh <host>` 永远是宿主 shell（例：Android），不探测、不读映射。
+_req=0
+[ -n "$opt_container" ] && _req=1
+[ -n "${RSH_CONTAINER:-}" ] && _req=1
+[ "$opt_ctr" -eq 1 ] && _req=1
+[ "${RSH_AUTODETECT:-0}" = 1 ] && _req=1
+
+if [ "$host_shell" -eq 0 ] && [ "${RSH_HOST_SHELL:-0}" != 1 ] && [ "$subcmd" != containers ] && [ "$_req" -eq 1 ]; then
+    _want=${opt_container:-${RSH_CONTAINER:-}}
+    if [ -n "$_want" ]; then
+        # -c / RSH_CONTAINER 最高优先级，映射不覆盖它
+        container_name=$_want
+        in_container=1
+    elif _m=$(container_lookup "$host"); then
         container_name=$(printf '%s' "$_m" | cut -f1)
         _mds=$(printf '%s' "$_m" | cut -f2)
         [ -n "$_mds" ] && container_ds=$_mds
         in_container=1
     else
-        _want=${opt_container:-${RSH_CONTAINER:-}}
-        if [ -n "$_want" ]; then
-            container_name=$_want
+        _cached=0; _cacheval=""
+        if [ "$refresh" -eq 0 ] && [ -f "$CACHE_FILE" ]; then
+            _cacheval=$(cat "$CACHE_FILE" 2>/dev/null || true)
+            _cached=1
+        fi
+        if [ "$_cached" -eq 1 ] && [ -n "$_cacheval" ] && [ "$_cacheval" != none ]; then
+            container_name=$(printf '%s' "$_cacheval" | cut -f1)
+            _cds=$(printf '%s' "$_cacheval" | cut -f2)
+            [ -n "$_cds" ] && container_ds=$_cds
             in_container=1
-        elif [ "${RSH_AUTODETECT:-1}" != 0 ]; then
-            if [ "$refresh" -eq 0 ] && [ -f "$CACHE_FILE" ]; then
-                _c=$(cat "$CACHE_FILE" 2>/dev/null || true)
-                if [ "$_c" != none ] && [ -n "$_c" ]; then
-                    container_name=$(printf '%s' "$_c" | cut -f1)
-                    _cds=$(printf '%s' "$_c" | cut -f2)
-                    [ -n "$_cds" ] && container_ds=$_cds
-                    in_container=1
-                fi
-            else
-                _prc=0; probe_remote || _prc=$?
-                case $_prc in
-                    0)
-                        _cnt=$(printf '%s' "$p_list" | awk 'NF { n++ } END { print n + 0 }')
-                        if [ "$_cnt" -eq 1 ]; then
-                            container_name=$(printf '%s\n' "$p_list" | cut -f1)
-                            container_ds=$p_bin
-                            _line=$(printf '%s\t%s' "$container_name" "$p_bin")
-                            cache_write "$_line"
-                            in_container=1
-                        elif [ "$_cnt" -eq 0 ]; then
-                            cache_write none
-                        else
-                            echo "$self: $host 上有多个 droidspaces 容器，无法自动选择：" >&2
-                            print_container_list >&2
-                            echo "      用 -c '<容器名>' 指定，或写映射：$CONTAINERS_FILE ← $host <容器名>" >&2
-                            echo "      要留在宿主 shell 加 -H。" >&2
+        elif [ "$_cached" -eq 1 ] && [ "$_cacheval" = none ] && [ "$opt_ctr" -eq 0 ]; then
+            :  # 旧自动模式：缓存说“没有容器”就不再重复探测
+        else
+            _prc=0; probe_remote || _prc=$?
+            case $_prc in
+                0)
+                    _cnt=$(printf '%s' "$p_list" | awk 'NF { n++ } END { print n + 0 }')
+                    if [ "$_cnt" -eq 1 ]; then
+                        container_name=$(printf '%s\n' "$p_list" | cut -f1)
+                        container_ds=$p_bin
+                        _line=$(printf '%s\t%s' "$container_name" "$p_bin")
+                        cache_write "$_line"
+                        in_container=1
+                    elif [ "$_cnt" -eq 0 ]; then
+                        cache_write none
+                        if [ "$opt_ctr" -eq 1 ]; then
+                            echo "$self: $host 上有 droidspaces，但没有正在运行的容器。" >&2
                             exit 2
-                        fi ;;
-                    1) cache_write none ;;
-                    *) : ;;  # ssh 本身失败：不缓存，交给主命令给出真实报错
-                esac
-            fi
+                        fi
+                    else
+                        echo "$self: $host 上有多个 droidspaces 容器，无法自动选择：" >&2
+                        print_container_list >&2
+                        echo "      用 -c '<容器名>' 指定，或写映射：$CONTAINERS_FILE ← $host <容器名>" >&2
+                        echo "      要留在宿主 shell 就不加 -C（默认就是宿主）。" >&2
+                        exit 2
+                    fi ;;
+                1)
+                    cache_write none
+                    if [ "$opt_ctr" -eq 1 ]; then
+                        echo "$self: $host 的宿主上没有 droidspaces，无法进容器（去掉 -C 即为宿主 shell）。" >&2
+                        exit 2
+                    fi ;;
+                *)
+                    if [ "$opt_ctr" -eq 1 ]; then
+                        echo "$self: 探测 $host 失败（ssh 连不上？）。" >&2
+                        exit 2
+                    fi ;;  # 旧自动模式：ssh 本身失败不缓存，交给主命令报错
+            esac
         fi
     fi
 fi
@@ -276,7 +307,7 @@ if [ "$subcmd" = containers ]; then
                     container_name=$(printf '%s\n' "$p_list" | cut -f1)
                     _line=$(printf '%s\t%s' "$container_name" "$p_bin")
                     cache_write "$_line"
-                    echo "已缓存：下次 $self $host 自动进该容器（-R 刷新，-H 回宿主）"
+                    echo "已缓存：下次 $self -C $host ... 直接进该容器（-R 刷新）"
                 else
                     echo "多个容器：请用 -c '<容器名>' 或映射文件 $CONTAINERS_FILE" >&2
                     exit 3

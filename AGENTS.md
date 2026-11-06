@@ -3,7 +3,7 @@
 > 上层：`~/.config/opencode/AGENTS.md` §SSH（选哪个工具）、`~/AGENTS.md` §二（主机别名与密钥）。
 
 ## 目录
-- `bin/rsh`：Linux 目标单条命令直通。`rsh host` 交互（自动 `exec bash -l`）；`rsh host <cmd>`；`rsh -f host <file|->` 把本地脚本喂 `bash --noprofile --norc -s`；`rsh -s host <cmd>` 加 `sudo -n`（**只接受单条命令**，复合命令 exit 2）；`rsh -n` 用远端原生 shell；`rsh --sess` 走 sess。命令本地 base64 后远端解码，绕开引号地狱。非 `-n` 模式远端自动前置 `~/.local/bin` 到 PATH，并在命令涉及 git/ssh/scp/sftp/rsync 时自愈远端 ssh-agent（`RSH_AGENT=auto|always|off`，`RSH_NO_AGENT_FIX=1` 关闭）。**droidspaces 容器直连**：远端有 `droidspaces` 且只有一个容器时自动 `run --` 进容器（缓存 `~/.cache/sshkit/<host>.container`，`-R` 刷新、`RSH_AUTODETECT=0` 关闭）；映射文件 `~/.config/sshkit/containers` 行格式 `<host><空白><容器名>[<TAB><ds路径>]`（容器名可含空格），`-c NAME` 显式指定，`rsh containers <host>` 探测+刷新，`-H`/`RSH_HOST_SHELL=1` 回宿主 shell。容器模式跳过宿主 PATH/agent 前导；`--sess` 不兼容（exit 2）。
+- `bin/rsh`：Linux 目标单条命令直通。`rsh host` 交互（自动 `exec bash -l`）；`rsh host <cmd>`；`rsh -f host <file|->` 把本地脚本喂 `bash --noprofile --norc -s`；`rsh -s host <cmd>` 加 `sudo -n`（**只接受单条命令**，复合命令 exit 2）；`rsh -n` 用远端原生 shell；`rsh --sess` 走 sess。命令本地 base64 后远端解码，绕开引号地狱。非 `-n` 模式远端自动前置 `~/.local/bin` 到 PATH，并在命令涉及 git/ssh/scp/sftp/rsync 时自愈远端 ssh-agent（`RSH_AGENT=auto|always|off`，`RSH_NO_AGENT_FIX=1` 关闭）。**droidspaces 容器直连**：默认 `rsh host` 停在宿主 shell，不探测；进容器用 `-C`（有映射用映射，否则现探单容器）、`-c NAME`、或容器 sshd 的独立别名（首选，scp/sess 全语义）。映射文件 `~/.config/sshkit/containers` 行格式 `<host><空白><容器名>[<TAB><ds路径>]`（容器名可含空格），只在进容器时生效；缓存 `~/.cache/sshkit/<host>.container`（`-R` 刷新），`RSH_AUTODETECT=1` 恢复「单容器自动进」，`rsh containers <host>` 探测+刷新，`-H`/`RSH_HOST_SHELL=1` 强制宿主。容器模式跳过宿主 PATH/agent 前导；`--sess` 不兼容（exit 2）。
 - `bin/wsh`：Windows 目标。三种解释器：默认跟随远端 `DefaultShell`（pwsh 7 / 5.1 / cmd，首次探测后缓存 `~/.cache/wsh/<host>.shell`，`wsh kind [--reset] <host>` 可查），`--shell pwsh|ps5|cmd`（别名 `--pwsh`/`--ps5`/`--cmd`）显式切换；跨解释器走 `pwsh.exe|powershell.exe -NoProfile -EncodedCommand <UTF-16LE base64>`，cmd 在 PS 下包成 `& cmd.exe /d /c '...'`（多行自动折成 ` & `，`goto`/label 不可用），子进程执行不保留 `cd`/`$env:`。输出统一强制 UTF-8（PS5.1 快路径也注入编码设置，cmd 含非 ASCII 时前置 `chcp 65001`）。默认 shell 已是 pwsh 时脚本 base64 后 `& ([scriptblock]::Create(...))`，不嵌套子进程；`wsh -f host <file|->`；本地 ssh-agent 与 `rsh` 同套探测+自愈（`WSH_AGENT=auto|off`、`WSH_NO_AGENT_FIX=1`，健康时跳过 `ssh-unlock`）。
 - `bin/sess`：每 host 一个 keeper 守护进程持 `ssh -T`，单条命令约 45ms（Windows 从 400ms 降下来），`cd`/env 跨命令保留。`sess run <host> [--new]`、`list`、`stop [host]`、`kind [--reset] <host>`。
 - `bin/ssh-unlock`：幂等解锁 ssh-agent（未解锁时用 `$SSH_PASS` 自动 `ssh-add`，不落盘）。
@@ -19,7 +19,7 @@
 - 一律显式落 bash（远端登录 shell 可能是 zsh）：`rsh`/`sess` 已内置 `bash --noprofile --norc`。
 - `rsh` 远端跑 `bash --noprofile --norc`，但非 `-n` 模式会先做一段前导：PATH 前置 `~/.local/bin`（存在才加）+ 按需自愈远端 ssh-agent。这段前导和用户命令拼在**同一条**远端命令里（base64 同一个 payload），所以不增加 ssh 往返；`-n` 只跑 agent 前导，PATH 保持原生。
 - **容器模式（droidspaces）不跑任何宿主前导**：容器里没有 `~/.local/bin/ssh-unlock`/agent socket，跑了只会误报；容器内命令一律 `bash --noprofile --norc`。
-- 容器已跑自己的 sshd 时（独立端口/别名，如 `realme-c`）**优先直连那个别名**：`scp`/`sess`/ControlMaster 全套语义都在，且比每次 `droidspaces run` 快（~90ms vs 100–200ms）；`rsh` 的包装模式只是容器没 sshd 时的兜底。
+- 容器已跑自己的 sshd 时（独立端口/别名，如 `ctr-host`）**优先直连那个别名**：`scp`/`sess`/ControlMaster 全套语义都在，且比每次 `droidspaces run` 快（~90ms vs 100–200ms）；`rsh` 的包装模式只是容器没 sshd 时的兜底。
 
 ## 已知坑（改协议/改实现必读）
 - **远端 agent 的死法**：`~/.ssh/agent.sock` 是陈旧 socket（`srw-------`）而 unit 已 failed —— `ssh-agent -D -a` 遇到已存在的 socket 会 exit 1，`~/.ssh/config` 的 `IdentityAgent` 指向它，于是所有 git/ssh 都 `Permission denied (publickey)`，报错完全不指向真因。`rsh` 已内置自愈（`ssh-add -l` rc=2 → `rm -f` socket → `systemctl --user restart ssh-agent` → 等 1s 内起来 → ssh-unlock）。远端 `SSH_PASS` 只在 `~/.bashrc`，非交互 shell 读不到，所以解锁要借 `bash -ic`。本地同一套故障也由 `rsh` 修（条件：socket 存在或本机有 `~/.config/systemd/user/ssh-agent.service`）。
@@ -38,5 +38,5 @@
 ## 性能参考（本机实测）
 - Linux：`ssh` 有 ControlMaster 时 16ms，`sess` 44ms → **单条命令直接 ssh/rsh，批处理/需要状态才用 sess**。
 - Windows：`sess` 45ms vs 每次新连接 400ms（8.7 倍）。
-- droidspaces 容器（`rsh` 包装，Android 宿主 + `run --` 多一层 exec）：稳态 **88–101 ms**；首次自动探测 **164 ms**、无缓存首条 **296 ms**、`-R` 刷新 **234 ms**；同机宿主基线 46–84 ms。容器自带 sshd 直连时与普通 Linux 主机同级（~90 ms）。
+- droidspaces 容器（`rsh -C ...` 包装，Android 宿主 + `run --` 多一层 exec）：稳态 **90–92 ms**；首次探测 **164 ms**、`-R` 刷新 **234 ms**、冷连接首条 ~550 ms；同机宿主基线 46–84 ms。容器自带 sshd 直连时与普通 Linux 主机同级（~90 ms）。
 - **2026-11-01 实测**：keeper 陈旧时 `wsh --sess host 1` 单条 **147 s**；`sess stop host` 重建后同一命令 **49～51 ms**，`wsh host 1` 70～120 ms。→ 慢不是 sess 的锅，是 keeper 陈旧，重置即可。
