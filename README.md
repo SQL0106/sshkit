@@ -47,7 +47,8 @@ rsh --sess linux-host 'cd /var/log; pwd'   # 下一条命令仍在 /var/log
 | 查远端默认解释器 | `wsh kind host`（`--reset` 重探） | 首次 ~0.5 s，之后 3 ms（读缓存） |
 | 需要保留 `cd`/env/函数（Linux） | `rsh --sess host '<cmd>'` | ~45 ms/条 |
 | 整段本地脚本 | `rsh -f host ./script.sh` / `wsh -f host ./script.ps1` | 一条命令 |
-| 进 droidspaces 容器（容器无 sshd） | `rsh host '<cmd>'` + `~/.config/sshkit/containers` 映射 | ~0.2 s |
+| 进 droidspaces 容器（容器已跑 sshd） | `rsh <容器自己的别名>`（如 `realme-c`，脱敏写作 `ctr-host`） | ~90 ms |
+| 进 droidspaces 容器（容器没 sshd，包装兜底） | `rsh host '<cmd>'`（单容器自动探测；映射/`-c` 可指定） | 90–300 ms |
 | 交互登录 | `rsh host` / `wsh host` | — |
 | 原生 shell（zsh/fish） | `rsh -n host '<cmd>'` | ~33 ms |
 
@@ -69,7 +70,7 @@ rsh -s host 'journalctl -n 20'        # 用户命令前加 sudo -n（只接受�
 rsh -n host 'echo $ZSH_VERSION'       # 不改 shell，用远端原生 zsh/sh
 rsh --sess host 'cd /etc; pwd'        # 走常驻会话
 rsh --sess -f host ./script.sh        # 整段脚本送进常驻会话
-rsh -H host 'echo $PATH'              # 直落宿主 shell，忽略容器映射（逃生口）
+rsh -H host 'echo $PATH'              # 直落宿主 shell，忽略容器（逃生口）
 ```
 
 工作方式：命令在本地 `base64 -w0`，远端拿到的只是一个 base64 串：
@@ -102,24 +103,32 @@ fi
 
 这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
 
-### droidspaces 容器直连（兜底）
+### droidspaces 容器直连（容器没跑 sshd 时）
 
 Android 设备上用 [droidspaces](https://github.com/ravindu644/Droidspaces-OSS) 跑 Linux 容器时，如果**容器自己没跑 sshd**，`rsh` 可以直接把命令送进容器，不用先在宿主 shell 里手打 `droidspaces run`。
 
-映射文件 `~/.config/sshkit/containers`（可用 `SSHKIT_CONTAINERS` 覆盖路径）：
+不做任何配置也能用：`rsh` 会像 `wsh kind` 探测远端 shell 那样，探测宿主有没有
+`droidspaces`、里面有哪些容器——**只有一个容器时自动进入**，结果缓存在
+`~/.cache/sshkit/<host>.container`（每台机只探一次）。
+
+想固定/覆盖就用映射文件 `~/.config/sshkit/containers`（可用 `SSHKIT_CONTAINERS` 覆盖路径）：
 
 ```sh
-# <host> <空白> <容器名>；tab 也行；# 开头是注释
+# <host> <空白> <容器名> [<TAB> <droidspaces 绝对路径>]
+# 容器名可含空格（取到 TAB 或行尾）；# 开头是注释
 linux-host debian-13
-android-host  Debian 13     # 容器名可含空格，取 host 之后的整行剩余部分
+android-host  Debian 13<TAB>/data/local/Droidspaces/bin/droidspaces
 ```
 
-命中后：
+命中后（自动探测与映射走同一条路）：
 
 ```sh
 rsh android-host 'cat /etc/os-release'    # 进容器执行
 rsh -f android-host ./script.sh           # 脚本喂容器里的 bash -s（stdin 也可以）
-rsh android-host                          # 交互进容器（bash -l）
+rsh android-host                          # 交互进容器（bash -l，读 /etc/profile）
+rsh containers android-host               # 查看 droidspaces 路径与容器列表，并刷新缓存
+rsh -c 'Debian 13' android-host 'id -u'   # 多容器/改名时显式指定
+rsh -R android-host 'id -u'               # 忽略缓存重新探测
 rsh -H android-host 'echo $PATH'          # 逃生口：留在 Android 宿主 shell
 ```
 
@@ -129,12 +138,20 @@ rsh -H android-host 'echo $PATH'          # 逃生口：留在 Android 宿主 sh
 ssh -T android-host "/data/local/Droidspaces/bin/droidspaces -n 'Debian 13' run -- bash --noprofile --norc -c 'eval \"\$(printf %s <B64> | base64 -d)\"'"
 ```
 
-- **只认显式映射**：host 不在文件里（或文件不存在）= 行为与以前完全一致，不做任何探测/缓存。删掉那一行就回到宿主 shell。
+- **解析顺序**：`-H`/`RSH_HOST_SHELL=1` → 宿主；`-c`/`RSH_CONTAINER` → 指定容器；
+  映射文件；缓存（`-R` 跳过）；最后才现探。探到 0 个容器或宿主没有 `droidspaces`
+  会写 `none` 缓存，之后直接走宿主 shell，不再每次多一次 ssh。
+- **多个容器不会瞎猜**：没映射也没 `-c` 时列出候选并 `exit 2`，提示写映射或加 `-c`。
+- **容器名可含空格**（如 `Debian 13`），不要加引号；映射里用 TAB 分隔可选的 droidspaces 路径。
 - **不跑宿主前导**：容器里没有 `~/.local/bin/ssh-unlock` 和那套 agent socket，PATH/agent 自愈一律跳过。
-- 容器名取 host 之后的**整行剩余**，所以带空格的容器名（如 `Debian 13`）直接写，不要加引号。
-- `RSH_DROIDSPACES` 可覆盖二进制路径（默认 `/data/local/Droidspaces/bin/droidspaces`）。
-- **`--sess` 与容器映射不兼容**：keeper 是宿主上的常驻 shell，组合使用直接 `exit 2` 并提示（去掉 `--sess`，或加 `-H` 留在宿主）。
-- 容器已经跑了自己的 sshd（如 `realme-c`）时**优先直连它**：`scp`、`--sess`、`-f` 全套语义都正常，比每次拉起 `droidspaces run` 更快（实测 92 ms vs 200 ms）。
+- `RSH_DROIDSPACES` 可覆盖二进制路径（默认 `/data/local/Droidspaces/bin/droidspaces`），
+  `RSH_CONTAINERS` 文件里也可以给某台机单独指定路径。
+- `RSH_AUTODETECT=0` 关闭自动探测：只认映射文件和 `-c`。
+- **`--sess` 与容器包装模式不兼容**：keeper 是宿主上的常驻 shell，组合使用直接 `exit 2` 并提示
+  （去掉 `--sess`，或加 `-H` 留在宿主）。
+- 容器已经跑了自己的 sshd（如 `realme-c`，`Port 22`）时**优先直连它**——这是首选路径，
+  `scp`、`--sess`、ControlMaster 全套语义都正常，比每次拉起 `droidspaces run` 更快
+  （实测约 90 ms vs 100–200 ms）；这一节描述的包装模式只是容器没跑 sshd 时的兜底。
 
 ## wsh
 

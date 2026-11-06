@@ -1,111 +1,79 @@
 # rsh 容器直连（droidspaces）— 任务规格与实测记录
 
 ## 目标
-宿主（Android）没有容器 sshd 时，`rsh <host>` 也能自动落进 droidspaces 容器执行。
-范围最小：只认显式映射文件，不做自动探测/缓存。
+`rsh <host>` 直接落进 droidspaces 容器执行，而不是停在 Android 宿主 shell。
+容器自带 sshd 时首选它的 ssh 别名（`scp`/`sess` 全语义），droidspaces 包装是兜底。
 
-## 规格（用户给定，勿扩大）
-- 映射文件 `~/.config/sshkit/containers`：每行 `<host><空白><容器名>`，允许 TAB，`#` 注释。
-  host 未命中 → 行为与今天完全一致（向后兼容）。
+## 规格（用户给定）
+- 映射文件 `~/.config/sshkit/containers`：`<host><空白><容器名>[<TAB><droidspaces 路径>]`，
+  `#` 注释、空行忽略；容器名可含空格（取到 TAB 或行尾）。
+- **自动探测**（用户追加，原话：「支持自动探测，和 wsh 探测命令解释器一样，探测有没有
+  droidspaces，有哪些容器」）：远端有 droidspaces 且只有一个容器 → 自动进入并缓存；
+  多容器 → 列候选 exit 2；没有/连不上 → 宿主 shell。
 - 命中时远端命令：
-  - 普通命令：`<ds> -n '<容器>' run -- bash --noprofile --norc -c '<base64 eval 串>'`（复用 wrap() 的本地 base64）
-  - `-f <file>` / `-f -`：`<ds> -n '<容器>' run -- bash -s`，脚本走 stdin
-  - 交互（无参数）：`<ds> -n '<容器>' run -- bash -l`
+  - 普通命令：`<ds> -n '<容器>' run -- bash --noprofile --norc -c '<base64 eval 串>'`
+  - `-f <file>` / `-f -`：`<ds> -n '<容器>' run -- bash --noprofile --norc -s`，脚本走 stdin
+  - 交互（无参数）：`<ds> -n '<容器>' run -- bash -l`（`enter` 在管道 stdin 下会挂住，弃用）
 - 逃生口：`-H` / `--host-shell` / `RSH_HOST_SHELL=1` → 直落 Android shell
-- 容器模式跳过宿主 PATH / agent 前导
-- `--sess` + 容器 → `exit 2` + 提示改用非 sess
-- 同步更新 bin/rsh 头部注释与 README 对应段落；文档脱敏（`linux-host` / `debian-13`）
+- 容器模式跳过宿主 PATH / agent 前导（容器里没有那套东西，探测只会误报）
+- `--sess` + 容器包装 → `exit 2` + 提示（keeper 在宿主；需要 sess 用容器 sshd 别名）
+- 文档脱敏（`linux-host` / `debian-13`，不写真实别名/IP/用户名）
 
 ## 已知事实（已实测，勿重复调研）
-- realme 宿主 root@192.168.1.100（`rsh realme`），PATH 仅 `/system/bin:/system/xbin`
-- droidspaces 固定路径 `/data/local/Droidspaces/bin/droidspaces`（v7.1.0），无 `list`；`show` 列容器
-- 容器名 `Debian 13`（带空格）；`run -- bash -s` stdin 可用，`run -- bash -c` 可用
-- 已有 `realme-c` 别名直连容器 sshd（约 92ms），本任务只做兜底路径
-- 工作区曾有一版 553 行草稿（自动探测 + `~/.cache/sshkit/<host>.container` 缓存 + `-c/-R/containers` 子命令），
-  **违反验收第 5 条**（删映射后仍会进容器），已废弃，备份在 `~/.cache/rsh-container-draft.sh`
+- droidspaces v7.1.0，固定路径 `/data/local/Droidspaces/bin/droidspaces`（不在 PATH），
+  **没有 `list`**；`show` 输出 UTF-8 制表框（NAME/PID 列），`awk -F'│'` 解析可靠。
+- 容器名可带空格；`run` 靠全局 `-n NAME` 选容器，`run --` 只管命令。
+- `run` 透传退出码；stdin 可穿透 `bash -s`；`droidspaces enter` + 管道 stdin 会挂住。
 
-## 实现（bin/rsh，355 行）
-- `usage()`：awk 提取头部注释块（原来 `sed -n '2,26p'` 写死行号，头部一长就截断）
-- `CONTAINERS_FILE=${SSHKIT_CONTAINERS:-$HOME/.config/sshkit/containers}`、`DS=${RSH_DROIDSPACES:-/data/local/Droidspaces/bin/droidspaces}`
-- `container_lookup host`：awk 跳过注释/空行，`$1==host` 时取**行内剩余全部**（容器名可含空格）→ 未命中 rc=1
-- `shq()`：单引号引用，值里含 `'` 直接 exit 2
-- `b64_eval()`：抽出原 wrap() 的 base64 串（无单引号）；`wrap()` 改为调用它（行为不变）
-- `cprefix()`：`<shq ds> -n <shq 容器> run --`
-- 分支插入点：选项解析加 `-H/--host-shell`；解析完 host 立即查映射（`host_shell` 或 `RSH_HOST_SHELL=1` 时跳过），sess 组合 exit 2；
-  `mode=file` / 交互 / 普通 exec 三处各加容器分支，均在 `use_sess` 之前、在 path/agent 前导之外
-- 选带 `-n '<容器>'` 的形式（不带也能跑，但多容器时歧义）
+## 实现（bin/rsh）
+- `usage()`：awk 提取头部连续 `#` 行（不再写死行号）。
+- 变量：`CONTAINERS_FILE`（`SSHKIT_CONTAINERS`）、`DS`（`RSH_DROIDSPACES`，默认
+  `/data/local/Droidspaces/bin/droidspaces`）、`CACHE_DIR`（`SSHKIT_CACHE_DIR`，
+  默认 `~/.cache/sshkit`）、`CACHE_FILE=<cache>/<host 净化>.container`。
+- `container_lookup host`：awk 跳过注释/空行，`$1==host` 时按**最后一个 TAB** 拆
+  名字/路径（名字可含空格，tab 也可作 host 与名字的分隔）→ `名字\t路径`。
+- `probe_remote()`：一次 `ssh -T` 拿回 droidspaces 路径 + `show` 的 base64；输出
+  `@@none`（宿主没有）/ `@@bin\t<path>` + b64；rc 0/1/2。本地解析 `NAME/PID` 行。
+- `cache_write()`：mkdir + 临时文件 + mv；内容 `名\t路径` 或 `none`。
+- 解析顺序：`-H`/env → 宿主；`-c`/`RSH_CONTAINER`；映射；缓存（`-R` 跳过）；
+  现探（单容器自动缓存；0 容器/无 droidspaces 写 `none`；ssh 失败不缓存）。
+- `rsh containers <host>`：强制现探并刷新缓存（无 droidspaces/连不上 exit 3）。
+- `shq()`：单引号引用（值含 `'` 直接 exit 2）；`cprefix()`：`<ds> -n <名> run --`。
+- 分支插入点：file / 交互 / 普通 exec 三处，均跳过 path/agent 前导。
 
-## TODO
-- [x] 1. 从 HEAD 恢复 bin/rsh，去掉未提交的超范围实现
-- [x] 2. 最小实现：映射解析、-H、容器 exec/-f/交互、sess 守卫
-- [x] 3. bin/rsh 头部注释 + README 段落（脱敏）
-- [x] 4. 写 ~/.config/sshkit/containers（realme → Debian 13）
-- [x] 5. 真机验收 1-5 + `sh -n` + 耗时
-- [x] 6. commit + push + install
+## 实测记录（oneplus8 → realme，2026-11-06）
 
-## 实测记录
+自动探测首次（`rsh containers realme`，空缓存）：**164 ms**
+```
+droidspaces: /data/local/Droidspaces/bin/droidspaces
+  Debian 13                pid=624
+已缓存：下次 rsh realme 自动进该容器（-R 刷新，-H 回宿主）
+```
 
-### 本地（stub ssh 拦参数，验证生成串与转义）
-映射样例 `linux-host debian-13` / `android-host<TAB>Debian 13`：
-- 普通命令：`ssh -T android-host "'/data/local/.../droidspaces' -n 'Debian 13' run -- bash --noprofile --norc -c 'eval \"$(printf %s ZWNoby... | base64 -d ...)\"'"`，无宿主前导 ✓
-- `-f -`：`... run -- bash --noprofile --norc -s`，stdin 直通（stub 报 18 bytes）✓
-- 未映射 host：只有原来的 path/agent 前导，无 droidspaces ✓
-- `-H` / `RSH_HOST_SHELL=1`：走原路径，含 `~/.local/bin` 前导 ✓
-- `-n` + 容器：`... run -- sh -c '...'` ✓；`-s` + 容器：`sudo -n` 贴进 base64 体 ✓
-- 映射文件不存在：等同未映射 ✓
-- `--sess` + 容器：`rsh: --sess 与容器模式不兼容…` rc=2 ✓
-
-### 真机（oneplus8 → realme，`/home/SQL916/sshkit/bin/rsh`）
-映射 `~/.config/sshkit/containers`：`realme Debian 13`
-
-1) `rsh realme 'head -4 /etc/os-release'`
+无映射、空缓存第一条命令（含探测）：**296 ms**
 ```
 PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
 NAME="Debian GNU/Linux"
-VERSION_ID="13"
-VERSION="13 (trixie)"
+Debian-13
+0
+systemd
 ```
-**0.216s** → 确实在容器里。
+之后稳态 **88–101 ms**（宿主 `rsh server` 46–84 ms）。
 
-2) `rsh -H realme 'echo $PATH'`
-```
-/system/bin:/system/xbin
-```
-**0.291s** → 逃生口回到 Android 宿主。
-
-3) `printf 'a=6\nb=7\necho "A=$((a*b))"\necho \'q="x y z"\'\n' | rsh -f realme -`
-```
-A=42
-q="x y z"
-```
-**0.154s**。再补一版证明跑在容器内（`. /etc/os-release`）：
-```
-echo "A=$((6*7))"
-. /etc/os-release; echo "$PRETTY_NAME"
-A=42
-Debian GNU/Linux 13 (trixie)
-```
-**0.166s** → 引号/算术/管道 stdin 全部原样到达，且落在容器。
-
-4) `rsh --sess realme foo`
-```
-rsh: --sess 与容器模式不兼容（sess keeper 在宿主 shell 上）。
-      去掉 --sess（普通 ssh），或加 -H 留在宿主 shell。
-rc=2
-```
-
-5) `mv ~/.config/sshkit/containers` 后 `rsh realme 'echo $PATH'`
-```
-/system/bin:/system/xbin
-```
-**0.068s** → 回宿主 shell（向后兼容）。恢复文件后再测 `head -1 /etc/os-release` → `PRETTY_NAME="Debian GNU/Linux 13 (trixie)"`（仅 0.216s 那次含容器启动开销）。
-
-### 语法
-`sh -n bin/rsh` → OK（355 行）。
+`rsh -H realme 'getprop ro.build.version.release'` → `16` / `host=localhost`（宿主）**166 ms**
+`rsh -f realme -`（中文/单双引号/反引号/管道）→ 原样输出，rc=0
+`rsh -f realme <本地脚本>` → 容器内输出 + 退出码 3 透传
+`rsh -s realme 'id -u'` → `0`；复合命令被 `-s` 规约拦下 rc=2
+`rsh -c 'Debian 13' realme ...` / `rsh -n realme`（sh）/ `--sess` 冲突 rc=2 均通过
+映射含 TAB 路径、宿主未命中（server → Linux/oneplus8 + `none` 缓存）通过
+`RSH_AUTODETECT=0` 无映射 → 宿主 shell（Android 16）
+多容器分支用本机 fake `droidspaces show`（`RSH_DROIDSPACES` 指向它）验证：
+列候选 exit 2；`rsh containers` exit 3
+交互（pty）：`$0=bash`、hostname `Debian-13`、PID1 `systemd`，正常 logout
+`-R` 强制刷新 **234 ms**；`sh -n bin/rsh` OK
 
 ## 已知限制
-- 只认显式映射：新增设备/改容器名要手改文件（刻意，避免"删了映射还进容器"）。
-- `--sess` 不可与容器同用（keeper 在宿主）。
-- 容器已自带 sshd 时（如 `realme-c`）应优先直连：92ms vs ~200ms，且 `scp`/`--sess` 语义完整。
-- 未处理 `droidspaces enter`（需要 PID / 交互 tty 行为不同），只用 `run --`。
-- 容器不存在时错误由 droidspaces 原样透出（不预设容器名可用性检查）。
+- `--sess` 不可与容器包装同用（keeper 在宿主）；用容器 sshd 别名可解。
+- 自动探测每台机首次多一次 ssh（之后走缓存）；`RSH_AUTODETECT=0` 可彻底关闭。
+- 只处理 `run --`，未用 `enter`（管道 stdin 会挂）。
+- 容器不存在时错误由 droidspaces 原样透出（不预检容器名）。
