@@ -47,6 +47,7 @@ rsh --sess linux-host 'cd /var/log; pwd'   # 下一条命令仍在 /var/log
 | 查远端默认解释器 | `wsh kind host`（`--reset` 重探） | 首次 ~0.5 s，之后 3 ms（读缓存） |
 | 需要保留 `cd`/env/函数（Linux） | `rsh --sess host '<cmd>'` | ~45 ms/条 |
 | 整段本地脚本 | `rsh -f host ./script.sh` / `wsh -f host ./script.ps1` | 一条命令 |
+| 进 droidspaces 容器（容器无 sshd） | `rsh host '<cmd>'` + `~/.config/sshkit/containers` 映射 | ~0.2 s |
 | 交互登录 | `rsh host` / `wsh host` | — |
 | 原生 shell（zsh/fish） | `rsh -n host '<cmd>'` | ~33 ms |
 
@@ -68,6 +69,7 @@ rsh -s host 'journalctl -n 20'        # 用户命令前加 sudo -n（只接受�
 rsh -n host 'echo $ZSH_VERSION'       # 不改 shell，用远端原生 zsh/sh
 rsh --sess host 'cd /etc; pwd'        # 走常驻会话
 rsh --sess -f host ./script.sh        # 整段脚本送进常驻会话
+rsh -H host 'echo $PATH'              # 直落宿主 shell，忽略容器映射（逃生口）
 ```
 
 工作方式：命令在本地 `base64 -w0`，远端拿到的只是一个 base64 串：
@@ -99,6 +101,40 @@ fi
   **自动探测有边界**（刻意取舍，不是缺陷）：只认命令文本里的 `git`/`ssh` 等字样，`rsh -f host -` 走 stdin 时不探测，远端解锁还依赖登录环境的 `SSH_PASS`。逐条说明与兜底（`RSH_AGENT=always`）见 [已知限制](#已知限制)。
 
 这也是「远端 `git clone` 莫名其妙 `Permission denied (publickey)`」的真因：agent 死了但 `~/.ssh/agent.sock` 还在，`~/.ssh/config` 的 `IdentityAgent` 指向这个死 socket。
+
+### droidspaces 容器直连（兜底）
+
+Android 设备上用 [droidspaces](https://github.com/ravindu644/Droidspaces-OSS) 跑 Linux 容器时，如果**容器自己没跑 sshd**，`rsh` 可以直接把命令送进容器，不用先在宿主 shell 里手打 `droidspaces run`。
+
+映射文件 `~/.config/sshkit/containers`（可用 `SSHKIT_CONTAINERS` 覆盖路径）：
+
+```sh
+# <host> <空白> <容器名>；tab 也行；# 开头是注释
+linux-host debian-13
+android-host  Debian 13     # 容器名可含空格，取 host 之后的整行剩余部分
+```
+
+命中后：
+
+```sh
+rsh android-host 'cat /etc/os-release'    # 进容器执行
+rsh -f android-host ./script.sh           # 脚本喂容器里的 bash -s（stdin 也可以）
+rsh android-host                          # 交互进容器（bash -l）
+rsh -H android-host 'echo $PATH'          # 逃生口：留在 Android 宿主 shell
+```
+
+展开成（容器名和二进制路径都单引号引用，命令仍走 base64，引号零转义）：
+
+```sh
+ssh -T android-host "/data/local/Droidspaces/bin/droidspaces -n 'Debian 13' run -- bash --noprofile --norc -c 'eval \"\$(printf %s <B64> | base64 -d)\"'"
+```
+
+- **只认显式映射**：host 不在文件里（或文件不存在）= 行为与以前完全一致，不做任何探测/缓存。删掉那一行就回到宿主 shell。
+- **不跑宿主前导**：容器里没有 `~/.local/bin/ssh-unlock` 和那套 agent socket，PATH/agent 自愈一律跳过。
+- 容器名取 host 之后的**整行剩余**，所以带空格的容器名（如 `Debian 13`）直接写，不要加引号。
+- `RSH_DROIDSPACES` 可覆盖二进制路径（默认 `/data/local/Droidspaces/bin/droidspaces`）。
+- **`--sess` 与容器映射不兼容**：keeper 是宿主上的常驻 shell，组合使用直接 `exit 2` 并提示（去掉 `--sess`，或加 `-H` 留在宿主）。
+- 容器已经跑了自己的 sshd（如 `realme-c`）时**优先直连它**：`scp`、`--sess`、`-f` 全套语义都正常，比每次拉起 `droidspaces run` 更快（实测 92 ms vs 200 ms）。
 
 ## wsh
 

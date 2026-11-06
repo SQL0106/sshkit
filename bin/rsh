@@ -10,6 +10,29 @@
 #   rsh -n <host> ...           # native：不改 shell，用远端默认 shell（zsh/sh）
 #   rsh --sess <host> <cmd>     # 走 sess 常驻会话：cd/变量/函数跨命令保留（~45ms/条）
 #   rsh --sess -f <host> <脚本>  # 同上，脚本整段送进常驻会话
+#   rsh -H <host> <cmd>         # 直落宿主 shell，忽略容器映射/自动探测
+#   rsh -c <容器> <host> <cmd>  # 指定容器（跳过自动探测）
+#   rsh -R <host> <cmd>         # 强制重新探测 droidspaces/容器（忽略缓存）
+#   rsh containers <host>       # 显示该机的 droidspaces 与容器，并刷新缓存
+#
+# droidspaces 容器直连（Android/KernelSU）：
+#   容器里跑着 sshd 时**优先用它的 ssh 别名**（示例：rsh android-c，~/.ssh/config 里
+#   Port 22）——scp/sess/ControlMaster 全套语义都可用，rsh 不需要任何包装。
+#   容器没跑 sshd 时，用 droidspaces 包装模式落进容器：
+#     - 显式映射 ~/.config/sshkit/containers，每行：<host><空白><容器名>[<TAB><droidspaces路径>]
+#         linux-host debian-13
+#         android-host  Debian 13<TAB>/data/local/Droidspaces/bin/droidspaces
+#       容器名可含空格（取到 TAB 或行尾），# 注释、空行忽略。
+#     - 没有映射就自动探测：远端有 droidspaces 且**只有一个**容器时自动进入，结果缓存
+#       在 ~/.cache/sshkit/<host>.container（-R 强制刷新；RSH_AUTODETECT=0 关闭）。
+#     - 有多个容器且没映射 → 列出候选并 exit 2（用 -c 或写映射文件）。
+#   命中后：
+#     rsh <host> <cmd>       → droidspaces -n '<容器>' run -- bash --noprofile --norc -c ...
+#     rsh -f <host> <脚本|->  → droidspaces -n '<容器>' run -- bash -s
+#     rsh <host>             → droidspaces -n '<容器>' run -- bash -l
+#   容器模式跳过宿主的 PATH/agent 前导（容器里没有那套 agent，探测只会误报）。
+#   回宿主 shell：-H/--host-shell 或 RSH_HOST_SHELL=1。
+#   --sess 与容器包装模式不兼容（keeper 在宿主上）→ exit 2；需要 sess/scp 就用容器 sshd 别名。
 #
 # 做的事：
 #   1) 本地：agent 未解锁时才调 ssh-unlock（先内联 ssh-add -l，省一次 fork）
@@ -62,25 +85,214 @@ if [ "$no_fix" != 1 ] && [ "$agent_mode" != off ]; then
     fi
 fi
 
+usage() {
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
 mode=exec
 sudo_run=0
 native=0
 use_sess=0
+host_shell=0
+refresh=0
+opt_container=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -f) mode=file; shift ;;
         -s) sudo_run=1; shift ;;
         -n) native=1; shift ;;
         -S|--sess) use_sess=1; shift ;;
-        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -H|--host-shell) host_shell=1; shift ;;
+        -R|--refresh) refresh=1; shift ;;
+        -c|--container)
+            [ $# -ge 2 ] || { echo "$self: -c 需要容器名" >&2; exit 2; }
+            opt_container=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) echo "$self: 未知选项 $1" >&2; exit 2 ;;
         *) break ;;
     esac
 done
 
-[ $# -ge 1 ] || { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+subcmd=""
+if [ "${1:-}" = containers ]; then
+    subcmd=containers
+    shift
+    [ $# -ge 1 ] || { echo "$self: 用法: $self containers <host>" >&2; exit 2; }
+fi
+
+[ $# -ge 1 ] || { usage; exit 2; }
 host=$1; shift
+
+# ---- droidspaces 容器：显式映射优先；未配置时自动探测（只有一个容器才进）----
+CONTAINERS_FILE=${SSHKIT_CONTAINERS:-"$HOME/.config/sshkit/containers"}
+DS=${RSH_DROIDSPACES:-/data/local/Droidspaces/bin/droidspaces}
+CACHE_DIR=${SSHKIT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sshkit}
+CACHE_FILE=$CACHE_DIR/$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_').container
+container_name=""
+container_ds=$DS
+in_container=0
+
+# 单引号引用；值里出现单引号直接拒绝（容器名/路径不该有）
+shq() {
+    case "$1" in
+        *\'*) echo "$self: 该值含单引号，无法安全引用: $1" >&2; exit 2 ;;
+    esac
+    printf "'%s'" "$1"
+}
+
+# 命中映射行 → 打印 "<容器名>\t<droidspaces路径>"（路径可空），未命中 rc=1。
+# 容器名允许空格：TAB 之前全是名字，TAB 之后是可选路径（不会出现在行首注释里）。
+container_lookup() {
+    [ -f "$CONTAINERS_FILE" ] || return 1
+    awk -v h="$1" '
+        { sub(/\r$/, "") }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $1 == h {
+            line = $0
+            sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            t = index(line, "\t")
+            if (t > 0) {
+                name = substr(line, 1, t - 1)
+                ds = substr(line, t + 1)
+                sub(/[[:space:]]+$/, "", name)
+            } else { name = line; ds = "" }
+            printf "%s\t%s\n", name, ds
+            found = 1; exit 0
+        }
+        END { if (!found) exit 1 }
+    ' "$CONTAINERS_FILE"
+}
+
+# 一次 ssh 拿回「droidspaces 路径 + show 输出」：@@none / @@bin\t<path>\n<b64(show)>
+# 返回 0 有 droidspaces，1 宿主没有，2 连不上/输出异常。
+probe_remote() {
+    _dsq=$(shq "$DS")
+    _probe="_ds=$_dsq
+if [ -x \"\$_ds\" ]; then _b=\$_ds; else _b=\$(command -v droidspaces 2>/dev/null || true); fi
+if [ -n \"\$_b\" ] && [ -x \"\$_b\" ]; then
+    printf '@@bin\\t%s\\n' \"\$_b\"
+    \"\$_b\" show 2>/dev/null | base64 | tr -d '\\n'
+    printf '\\n'
+else
+    printf '@@none\\n'
+fi"
+    _out=$(ssh -T "$host" "$_probe" </dev/null 2>/dev/null) || return 2
+    case $_out in
+        @@none) return 1 ;;
+        @@bin*) : ;;
+        *) return 2 ;;
+    esac
+    p_bin=$(printf '%s\n' "$_out" | sed -n '1s/^@@bin	//p')
+    p_b64=$(printf '%s\n' "$_out" | sed -n '2p')
+    [ -n "$p_bin" ] || return 2
+    p_list=$(printf '%s' "$p_b64" | base64 -d 2>/dev/null | awk -F'│' '
+        NF > 2 {
+            n = $2; p = $3
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", n)
+            gsub(/[[:space:]]+/, "", p)
+            if (n != "" && n != "NAME" && p ~ /^[0-9]+$/) printf "%s\t%s\n", n, p
+        }')
+    return 0
+}
+
+cache_write() {
+    [ -d "$CACHE_DIR" ] || mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+    _tmp=$CACHE_FILE.tmp.$$
+    if printf '%s\n' "$1" > "$_tmp" 2>/dev/null; then
+        mv -f "$_tmp" "$CACHE_FILE" 2>/dev/null || rm -f "$_tmp"
+    else
+        rm -f "$_tmp"
+    fi
+}
+
+# 容器清单（供 rsh containers 复用）
+print_container_list() {
+    printf '%s\n' "$p_list" | awk -F'\t' '{ printf "  %-24s pid=%s\n", $1, $2 }'
+}
+
+if [ "$host_shell" -eq 0 ] && [ "${RSH_HOST_SHELL:-0}" != 1 ] && [ "$subcmd" != containers ]; then
+    if _m=$(container_lookup "$host"); then
+        container_name=$(printf '%s' "$_m" | cut -f1)
+        _mds=$(printf '%s' "$_m" | cut -f2)
+        [ -n "$_mds" ] && container_ds=$_mds
+        in_container=1
+    else
+        _want=${opt_container:-${RSH_CONTAINER:-}}
+        if [ -n "$_want" ]; then
+            container_name=$_want
+            in_container=1
+        elif [ "${RSH_AUTODETECT:-1}" != 0 ]; then
+            if [ "$refresh" -eq 0 ] && [ -f "$CACHE_FILE" ]; then
+                _c=$(cat "$CACHE_FILE" 2>/dev/null || true)
+                if [ "$_c" != none ] && [ -n "$_c" ]; then
+                    container_name=$(printf '%s' "$_c" | cut -f1)
+                    _cds=$(printf '%s' "$_c" | cut -f2)
+                    [ -n "$_cds" ] && container_ds=$_cds
+                    in_container=1
+                fi
+            else
+                _prc=0; probe_remote || _prc=$?
+                case $_prc in
+                    0)
+                        _cnt=$(printf '%s' "$p_list" | awk 'NF { n++ } END { print n + 0 }')
+                        if [ "$_cnt" -eq 1 ]; then
+                            container_name=$(printf '%s\n' "$p_list" | cut -f1)
+                            container_ds=$p_bin
+                            _line=$(printf '%s\t%s' "$container_name" "$p_bin")
+                            cache_write "$_line"
+                            in_container=1
+                        elif [ "$_cnt" -eq 0 ]; then
+                            cache_write none
+                        else
+                            echo "$self: $host 上有多个 droidspaces 容器，无法自动选择：" >&2
+                            print_container_list >&2
+                            echo "      用 -c '<容器名>' 指定，或写映射：$CONTAINERS_FILE ← $host <容器名>" >&2
+                            echo "      要留在宿主 shell 加 -H。" >&2
+                            exit 2
+                        fi ;;
+                    1) cache_write none ;;
+                    *) : ;;  # ssh 本身失败：不缓存，交给主命令给出真实报错
+                esac
+            fi
+        fi
+    fi
+fi
+
+if [ "$subcmd" = containers ]; then
+    _prc=0; probe_remote || _prc=$?
+    case $_prc in
+        0)
+            printf 'droidspaces: %s\n' "$p_bin"
+            _cnt=$(printf '%s' "$p_list" | awk 'NF { n++ } END { print n + 0 }')
+            if [ "$_cnt" -eq 0 ]; then
+                echo "  （没有容器）"
+                cache_write none
+            else
+                print_container_list
+                if [ "$_cnt" -eq 1 ]; then
+                    container_name=$(printf '%s\n' "$p_list" | cut -f1)
+                    _line=$(printf '%s\t%s' "$container_name" "$p_bin")
+                    cache_write "$_line"
+                    echo "已缓存：下次 $self $host 自动进该容器（-R 刷新，-H 回宿主）"
+                else
+                    echo "多个容器：请用 -c '<容器名>' 或映射文件 $CONTAINERS_FILE" >&2
+                    exit 3
+                fi
+            fi
+            exit 0 ;;
+        1) cache_write none; echo "$self: $host 上没有 droidspaces（回宿主 shell）" >&2; exit 3 ;;
+        *) echo "$self: 连不上 $host" >&2; exit 3 ;;
+    esac
+fi
+
+if [ "$in_container" -eq 1 ] && [ "$use_sess" -eq 1 ]; then
+    echo "$self: --sess 与容器包装模式不兼容（sess keeper 在宿主 shell 上）。" >&2
+    echo "      去掉 --sess（普通 ssh）；容器自己跑了 sshd 时改用它的别名；或加 -H 留在宿主。" >&2
+    exit 2
+fi
 
 # 远端 PATH 前置 ~/.local/bin（纯内建，无 fork；-n 保持原生语义不动）
 path_prelude='case ":$PATH:" in
@@ -136,14 +348,25 @@ agent_wanted() {
     printf '%s' "$1" | grep -Eq "$agent_re"
 }
 
+# 生成「本地 base64 → 远端解码后 eval」的内层串（不含外层解释器，无单引号）。
+b64_eval() {
+    b64=$(printf '%s' "$1" | base64 | tr -d '\n')
+    printf 'eval "$(printf %%s %s | base64 -d 2>/dev/null || printf %%s %s | base64 -D)"' "$b64" "$b64"
+}
+
 # 把一段脚本文本包成「远端强制 bash 执行」的命令串。
 wrap() {
-    b64=$(printf '%s' "$1" | base64 | tr -d '\n')
+    _e=$(b64_eval "$1")
     if [ "$native" -eq 1 ]; then
-        printf '%s' "eval \"\$(printf %s $b64 | base64 -d 2>/dev/null || printf %s $b64 | base64 -D)\""
+        printf '%s' "$_e"
     else
-        printf '%s' "if command -v bash >/dev/null 2>&1; then bash --noprofile --norc -c 'eval \"\$(printf %s $b64 | base64 -d 2>/dev/null || printf %s $b64 | base64 -D)\"'; else sh -c 'eval \"\$(printf %s $b64 | base64 -d 2>/dev/null || printf %s $b64 | base64 -D)\"'; fi"
+        printf '%s' "if command -v bash >/dev/null 2>&1; then bash --noprofile --norc -c '$_e'; else sh -c '$_e'; fi"
     fi
+}
+
+# 容器前缀：<ds> -n '<容器>' run --
+cprefix() {
+    printf '%s -n %s run --' "$(shq "$container_ds")" "$(shq "$container_name")"
 }
 
 # -s 只对「单条命令」成立：sudoers 按命令路径授权，包一层 bash 必被拒；
@@ -169,6 +392,15 @@ if [ "$mode" = file ]; then
     [ -n "$src" ] || { echo "$self: -f 需要脚本路径（用 - 表示 stdin）" >&2; exit 2; }
     if [ "$sudo_run" -eq 1 ]; then
         echo "$self: -f 模式下 -s 无效（脚本里请自己写 sudo -n）" >&2
+    fi
+    if [ "$in_container" -eq 1 ]; then
+        # 脚本直接从 stdin 喂给容器里的 bash -s；不跑宿主 PATH/agent 前导。
+        if [ "$native" -eq 1 ]; then _interp='sh -s'; else _interp='bash --noprofile --norc -s'; fi
+        if [ "$src" = "-" ]; then
+            exec ssh -T "$host" "$(cprefix) $_interp"
+        fi
+        [ -r "$src" ] || { echo "$self: 读不到 $src" >&2; exit 2; }
+        exec ssh -T "$host" "$(cprefix) $_interp" < "$src"
     fi
     if [ "$native" -eq 1 ]; then
         interp='sh -s'
@@ -217,6 +449,11 @@ if [ $# -eq 0 ]; then
         echo "$self: --sess 是非交互会话，交互请直接 $self $host" >&2
         exit 2
     fi
+    if [ "$in_container" -eq 1 ]; then
+        # 交互用 run -- bash -l（能读 /etc/profile）；enter 在 ssh -t 下会挂住
+        if [ "$native" -eq 1 ]; then exec ssh -t "$host" "$(cprefix) sh -l"; fi
+        exec ssh -t "$host" "$(cprefix) bash -l"
+    fi
     if [ "$native" -eq 1 ]; then
         exec ssh -t "$host"
     fi
@@ -226,6 +463,14 @@ fi
 
 if [ "$sudo_run" -eq 1 ]; then
     sudo_check "$*"
+fi
+
+if [ "$in_container" -eq 1 ]; then
+    # 跳过宿主 PATH/agent 前导：容器里没有那套 socket，探测只会误报。
+    # 命令照旧本地 base64，由容器里的 bash 解析。
+    if [ "$sudo_run" -eq 1 ]; then _body="sudo -n $*"; else _body=$*; fi
+    if [ "$native" -eq 1 ]; then _shell='sh -c'; else _shell='bash --noprofile --norc -c'; fi
+    exec ssh -T "$host" "$(cprefix) $_shell $(shq "$(b64_eval "$_body")")"
 fi
 
 if [ "$use_sess" -eq 1 ]; then
