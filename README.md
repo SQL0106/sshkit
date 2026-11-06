@@ -290,6 +290,16 @@ echo "$SSH_PASS"
 SSHKIT_BIN=/usr/local/bin ./install.sh   # 换安装目录
 ```
 
+**装到别的 Linux 主机或容器里**（例如远端 Debian、droidspaces 容器）：在目标机上 `git clone` 本仓库后装到 `~/.local/bin` 并确保该目录在 `PATH` 里：
+
+```sh
+git clone git@github.com:SQL0106/sshkit.git ~/sshkit
+cd ~/sshkit && install -m 755 bin/rsh bin/rshc bin/sess bin/ssh-unlock ~/.local/bin/
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+本机 / 远端 / 容器各装一份的好处：`rsh` 从容器里也能再跳一跳（`rsh server`、`rshc host`），不必回宿主机中转。
+
 配合的 `~/.ssh/config`（ControlMaster 是「单条命令 15ms」的关键）：
 
 ```
