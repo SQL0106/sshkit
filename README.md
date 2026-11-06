@@ -72,6 +72,7 @@ rsh --sess host 'cd /etc; pwd'        # 走常驻会话
 rsh --sess -f host ./script.sh        # 整段脚本送进常驻会话
 rsh -H host 'echo $PATH'              # 强制宿主 shell，忽略容器映射（默认本来就是宿主）
 rsh -C host 'uname -a'                # 显式进 droidspaces 容器（容器没跑 sshd 时）
+rshc host 'uname -a'                  # = rsh -C 的简写（仅进容器时用）
 ```
 
 工作方式：命令在本地 `base64 -w0`，远端拿到的只是一个 base64 串：
@@ -111,7 +112,7 @@ Android 设备上用 [droidspaces](https://github.com/ravindu644/Droidspaces-OSS
 **默认 `rsh host` 永远停在宿主 shell**（Android 的 ksu/ksutools shell），不做任何探测；要进容器必须显式指定。三选一：
 
 1. **容器自己跑了 sshd** → 给它配一个独立的 ssh 别名（不同端口）直接连，例如 `rsh ctr-host`。这是首选：`scp`、`--sess`、ControlMaster 全套语义都正常，也最快（约 90 ms）。
-2. **`rsh -C host '<cmd>'`**：显式要求进容器。有映射文件就按映射，否则现探宿主上的 `droidspaces` 和容器列表（只有一个容器就直接进，结果缓存）。探不到会明确报错，不会静默落回宿主。
+2. **`rsh -C host '<cmd>'`**（简写 `rshc host '<cmd>'`，完全等价）：显式要求进容器。有映射文件就按映射，否则现探宿主上的 `droidspaces` 和容器列表（只有一个容器就直接进，结果缓存）。探不到会明确报错，不会静默落回宿主。
 3. **`rsh -c '<容器名>' host '<cmd>'`**：名字写死在命令里，优先于映射文件。
 
 映射文件 `~/.config/sshkit/containers`（`SSHKIT_CONTAINERS` 可覆盖路径）用于固定「哪台机进哪个容器」：
@@ -148,6 +149,7 @@ ssh -T android-host "/data/local/Droidspaces/bin/droidspaces -n 'debian-13' run 
 - `RSH_AUTODETECT=1` 恢复旧的自动模式：裸 `rsh host` 也会探测，只有一个容器时自动进入。默认关闭，避免误进容器。
 - **`--sess` 与容器包装模式不兼容**：keeper 是宿主上的常驻 shell，组合使用直接 `exit 2` 并提示（去掉 `--sess`，或改用容器 sshd 的别名）。
 - 容器已经跑了自己的 sshd 时**优先直连那个别名**：`scp`、`--sess` 全都能用，比每次拉起 `droidspaces run` 更快；这一节描述的包装模式只是容器没跑 sshd 时的兜底。
+- **端口共存**：容器网络若是 `net_mode=host`（与 Android 共享 netns），容器 sshd 和 Android 的 sshd 不能抢同一个端口。常见布局是 Android 用 8022、容器用 22（反过来也行，给容器 2222 再配别名）。若某台机 Android 的 ssh 已经占了 22，容器 sshd 会起不来 —— 此时要么改容器 sshd 端口，要么用 `rshc` 包装（完全不依赖 22）。
 
 ## wsh
 

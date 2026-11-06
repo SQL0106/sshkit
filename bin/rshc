@@ -1,0 +1,17 @@
+#!/bin/sh
+# rshc —— `rsh -C` 的简写：显式进 droidspaces 容器
+#
+# 用法：
+#   rshc <host> [命令...]        # 等价于 rsh -C <host> [命令...]
+#   rshc -f <host> <file|->      # 把本地脚本喂给容器内的 bash
+#   rshc <host>                  # 交互（容器内 bash -l）
+#   rshc -c '<容器名>' <host>    # 指定容器（优先于映射）
+#
+# 其余选项（-n/-s/-R/-H 等）原样透传给 rsh；--sess 与容器包装不兼容（exit 2）。
+set -u
+
+self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x "$self_dir/rsh" ]; then
+    exec "$self_dir/rsh" -C "$@"
+fi
+exec rsh -C "$@"

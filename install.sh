@@ -19,10 +19,10 @@ for a in "$@"; do
 done
 
 mkdir -p "$DEST"
-for f in rsh wsh sess ssh-unlock; do
+for f in rsh rshc wsh sess ssh-unlock; do
     install -m 0755 "$SRC/bin/$f" "$DEST/$f"
 done
-echo "已安装到 $DEST: rsh wsh sess ssh-unlock"
+echo "已安装到 $DEST: rsh rshc wsh sess ssh-unlock"
 
 case ":$PATH:" in
     *":$DEST:"*) ;;
