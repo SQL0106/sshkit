@@ -150,6 +150,7 @@ ssh -T android-host "/data/local/Droidspaces/bin/droidspaces -n 'debian-13' run 
 - **`--sess` 与容器包装模式不兼容**：keeper 是宿主上的常驻 shell，组合使用直接 `exit 2` 并提示（去掉 `--sess`，或改用容器 sshd 的别名）。
 - 容器已经跑了自己的 sshd 时**优先直连那个别名**：`scp`、`--sess` 全都能用，比每次拉起 `droidspaces run` 更快；这一节描述的包装模式只是容器没跑 sshd 时的兜底。
 - **端口共存**：容器网络若是 `net_mode=host`（与 Android 共享 netns），容器 sshd 和 Android 的 sshd 不能抢同一个端口。常见布局是 Android 用 8022、容器用 22（反过来也行，给容器 2222 再配别名）。若某台机 Android 的 ssh 已经占了 22，容器 sshd 会起不来 —— 此时要么改容器 sshd 端口，要么用 `rshc` 包装（完全不依赖 22）。
+- **容器自启**：容器里的 sshd 是它自己的 systemd 服务（`ssh.service`），容器不启动就没有 22 端口。要让手机重启后仍能直连，把该容器 `container.config` 的 `run_at_boot` 设为 `1`（droidspaces 的 Magisk 服务会在开机且网络就绪后自动启动这些容器；日志在 `/data/local/Droidspaces/Logs/boot-module.log`）。改前先备份该文件。
 
 ## wsh
 

@@ -86,3 +86,12 @@ droidspaces: /data/local/Droidspaces/bin/droidspaces
 - 只处理 `run --`，未用 `enter`（管道 stdin 会挂）。
 - 容器不存在时错误由 droidspaces 原样透出（不预检容器名）。
 - 裸 `rsh host` 不探测；想恢复旧行为设 `RSH_AUTODETECT=1`。
+
+## 容器 sshd、端口与开机自启
+
+- 容器里的 sshd 是容器自带的 systemd `ssh.service`（enabled），**容器起来才有 22 端口**；
+  Android 的 sshd 是另一套（实测 8022）。两者 `net_mode=host` 共享 netns，不能同占一个端口。
+- 要重启后仍能直连：把容器 `container.config` 的 `run_at_boot` 改 `1`（改前备份；
+  文件头注明可能被自动重写）。droidspaces 的 Magisk 服务会等 `sys.boot_completed` 和网络就绪后
+  自启所有 `run_at_boot=1` 的容器，日志 `/data/local/Droidspaces/Logs/boot-module.log`。
+- 若某台机 Android 先占了 22：给容器 sshd 换端口（如 2222）再配别名，或用 `rshc`（不依赖端口）。

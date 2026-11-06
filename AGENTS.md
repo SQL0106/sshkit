@@ -28,6 +28,7 @@
 - **droidspaces 容器探测**（v7.1.0）：二进制不在 PATH（固定 `/data/local/Droidspaces/bin/droidspaces`），**没有 `list`**，靠 `show` 的 UTF-8 制表框解析（`awk -F'│'` 取 NAME/PID）；容器名可含空格，靠全局 `-n NAME` 选容器，`run --` 后面才是命令。`enter` 在 stdin 被管道时挂住，一律用 `run -- bash -l`。
 - 容器探测**只在需要时做一次**：成功的单容器写 `名<TAB>路径` 缓存，0 容器/无 droidspaces 写 `none`，**ssh 失败不写缓存**（否则一次网络抖动会永久禁用容器）。多容器不猜：列候选 `exit 2`，用映射/`-c` 指定。
 - 映射文件用**最后一个 TAB** 分隔可选 droidspaces 路径，TAB 前为容器名（因此名字里的空格安全；行尾空白被 trim）。`--sess` + 容器包装直接 exit 2，keeper 在宿主，改用容器 sshd 别名或去掉 `--sess`。
+- **容器 sshd 与端口**：容器内的 sshd 是它自己的 `ssh.service`（systemd，enabled），容器起来才有端口；`net_mode=host` 共享 netns 时与 Android sshd 必须错开（实测某机 Android 8022 / 容器 22）。容器不自启则重启后没有 22：把 `container.config` 的 `run_at_boot` 改 `1`（先备份，文件头注明可能被自动重写），droidspaces 的 Magisk 服务会等 `sys.boot_completed` + 网络就绪后自启，日志 `/data/local/Droidspaces/Logs/boot-module.log`。
 - `sess` 哨兵必须在 stdout 和 stderr 各写一份 `__END__<tok>:<rc>`（单哨兵会导致 stderr 偶发丢失）。
 - 本地 socket 帧格式 = `kind + 4 字节长度 + 数据`（`O`/`E`/`R`），socket 在 `~/.cache/sess/<host>.v3.sock`；改协议要改 `PROTO`。
 - 改过 `sess` 源码后旧 keeper 自动退役：`~/.cache/sess/<host>.sig` 存源码 `mtime:size` 指纹。某 host 突然从 45ms 变几百 ms → `sess stop <host>`。
