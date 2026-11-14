@@ -83,7 +83,16 @@ public class SessKeeper
 
     private void Log(string m)
     {
-        try { File.AppendAllText(logFile, DateTime.Now.ToString("HH:mm:ss") + " " + m + "\n"); }
+        try
+        {
+            // 必须用 FileShare.ReadWrite：拉起方已经把同一个日志文件打开（重定向控制台），
+            // File.AppendAllText 的默认共享模式会撞 sharing violation，日志整份丢失。
+            byte[] b = Encoding.UTF8.GetBytes(DateTime.Now.ToString("HH:mm:ss.fff") + " " + m + "\n");
+            using (FileStream fs = new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+            {
+                fs.Write(b, 0, b.Length);
+            }
+        }
         catch { }
     }
 
@@ -112,14 +121,17 @@ public class SessKeeper
             try { lockStream.Close(); } catch { }
             return;
         }
+        Log("run start kind=" + kind);
         srv = new TcpListener(IPAddress.Loopback, 0);
         srv.Start();
+        Log("listening");
         int port = ((IPEndPoint)srv.LocalEndpoint).Port;
         File.WriteAllText(portFile, port.ToString() + "\n" + token + "\n");
         File.WriteAllText(pidFile, Process.GetCurrentProcess().Id.ToString() + "\n");
         Log("keeper up kind=" + kind + " port=" + port);
         try { Spawn(); }
-        catch (Exception e) { Log("spawn failed: " + e.Message); throw; }
+        catch (Exception e) { Log("spawn failed: " + e.Message + " | " + e.StackTrace); throw; }
+        Log("remote session ready");
 
         while (!killNow)
         {
@@ -627,17 +639,30 @@ if ($op -eq '__keeper') {
     $kCache = Get-ShkCache 'sess'
     # 自己的控制台输出也落日志：keeper 的 stdout/stderr 由拉起的进程重定向，
     # 没人读，任何宿主输出都可能塞满缓冲区把 keeper 卡死。
-    try {
-        $kLogPath = Join-Path $kCache ($kHost + '.v4.log')
-        $kFs = [System.IO.File]::Open($kLogPath, 'Append', 'Write', 'ReadWrite')
-        $kSw = New-Object System.IO.StreamWriter($kFs)
-        $kSw.AutoFlush = $true
-        [Console]::SetOut($kSw)
-        [Console]::SetError($kSw)
-    } catch { }
+    # 调试时 SSHKIT_SESS_DEBUG=1，保持前台输出（用于 CI/手工排查）。
+    if ($env:SSHKIT_SESS_DEBUG -ne '1') {
+        try {
+            $kLogPath = Join-Path $kCache ($kHost + '.v4.log')
+            $kFs = [System.IO.File]::Open($kLogPath, 'Append', 'Write', 'ReadWrite')
+            $kSw = New-Object System.IO.StreamWriter($kFs)
+            $kSw.AutoFlush = $true
+            [Console]::SetOut($kSw)
+            [Console]::SetError($kSw)
+        } catch { }
+    }
     Add-Type -TypeDefinition $CSharpKeeper -Language CSharp
     $k = New-Object SessKeeper -ArgumentList $kHost, $kKind, $kCache, $kRemote
     $k.Run()
+    exit 0
+}
+
+if ($op -eq '__remote') {
+    # 调试用：打印 kind 与 base64 后的远端命令（可直接喂给 __keeper）
+    if ($argv.Count -lt 2) { [Console]::Error.WriteLine('sess: __remote 需要主机名'); exit 2 }
+    $rHost = [string]$argv[1]
+    $rKind = Get-ShkSessKind $rHost
+    [Console]::Out.WriteLine($rKind)
+    [Console]::Out.WriteLine((ConvertTo-ShkB64 (Get-ShkSessRemoteCommand $rHost $rKind)))
     exit 0
 }
 

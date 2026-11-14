@@ -145,18 +145,28 @@ jobs:
           Write-Host '--- sess kind ---'
           & pwsh -NoProfile -File win/sess.ps1 kind --reset localhost
 
+          $info = & pwsh -NoProfile -File win/sess.ps1 __remote localhost
+          $kind = [string]$info[0]
+          $b64 = [string]$info[1]
+          Write-Host "kind=$kind b64len=$($b64.Length)"
+
+          # 前台跑 keeper（DEBUG=1 → 不重定向控制台），看它停在哪一步
           $job = Start-Job -ScriptBlock {
             Set-Location $using:PWD
-            $env:SSHKIT_SESS_FIRST_BYTE = '15'
-            & pwsh -NoProfile -File win/sess.ps1 run localhost '"hello-sess"' 2>&1
-            "rc=$LASTEXITCODE"
+            $env:SSHKIT_SESS_DEBUG = '1'
+            & pwsh -NoProfile -File win/sess.ps1 __keeper localhost $using:kind $using:b64 2>&1
           }
-          if (Wait-Job $job -Timeout 60) {
-            Receive-Job $job | ForEach-Object { Write-Host $_ }
-          } else {
-            Write-Host 'TIMEOUT: sess run 60s 未返回'
-            Stop-Job $job -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 15
+          Write-Host '--- keeper 前台输出 ---'
+          Receive-Job $job 2>&1 | ForEach-Object { Write-Host $_ }
+
+          $port = Join-Path $env:USERPROFILE '.cache\sess\localhost.v4.port'
+          Write-Host ("port file 存在: " + (Test-Path $port))
+          if (Test-Path $port) {
+            $r = & pwsh -NoProfile -File win/sess.ps1 run localhost '"hello-sess"' 2>&1
+            Write-Host ("run=[" + ($r -join ' | ') + "]")
           }
+          Stop-Job $job -ErrorAction SilentlyContinue
           Remove-Job $job -Force -ErrorAction SilentlyContinue
 
           $log = Join-Path $env:USERPROFILE '.cache\sess\localhost.v4.log'
