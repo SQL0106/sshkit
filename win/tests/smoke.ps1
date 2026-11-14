@@ -119,6 +119,26 @@ if ($WinHostName -and -not $SkipSsh) {
     & $exe -NoProfile -File $wsh --direct $WinHostName 'exit 7' 2>&1 | Out-Null
     Check 'wsh 退出码 7' ($LASTEXITCODE -eq 7) "rc=$LASTEXITCODE"
 
+    # stdin 透传：远端从 ssh 通道读一行（验证子进程 stdin 句柄没丢）
+    $pi = New-Object System.Diagnostics.ProcessStartInfo
+    $pi.FileName = $exe
+    $pi.UseShellExecute = $false
+    $pi.RedirectStandardInput = $true
+    $pi.RedirectStandardOutput = $true
+    $argList = @('-NoProfile', '-File', $wsh, '--direct', $WinHostName, '$x = [Console]::In.ReadLine(); "got=$x"')
+    if ($null -ne $pi.PSObject.Properties['ArgumentList']) {
+        foreach ($x in $argList) { $pi.ArgumentList.Add($x) }
+    } else {
+        $pi.Arguments = ($argList | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    }
+    $pp = [System.Diagnostics.Process]::Start($pi)
+    $pp.StandardInput.NewLine = "`n"
+    $pp.StandardInput.WriteLine('PIPED-WIN')
+    $pp.StandardInput.Close()
+    $stdinOut = $pp.StandardOutput.ReadToEnd()
+    $pp.WaitForExit()
+    Check 'wsh stdin 透传' ($stdinOut -match 'got=PIPED-WIN') $stdinOut
+
     if (-not $NoSess) {
         $out = & $exe -NoProfile -File $wsh $WinHostName 'echo "via-sess"' 2>&1
         Check 'wsh 默认(sess) 执行' (($out -join "`n") -match 'via-sess') ($out -join ' | ')

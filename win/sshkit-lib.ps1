@@ -118,9 +118,14 @@ function Start-ShkProcess {
     <#
       启动一个进程并把退出码返回给调用方。
         -ArgList      参数数组（精确传递，不经 shell 解析）
-        -RedirectIn   重定向 stdin（配合 -StdinBytes 写脚本；不重定向则继承）
+        -RedirectIn   重定向 stdin（配合 -StdinBytes 写脚本）
         -StdinBytes   要写入 stdin 的字节；null 表示不写
-        -Capture      捕获 stdout/stderr 并返回（用于探测；默认不捕获=字节透传）
+        -Capture      捕获 stdout/stderr 并返回（用于探测）
+        -Interactive  完全不重定向（交互式 ssh -t 需要真 TTY）
+      默认：重定向 stdout/stderr 并**自己泵字节**到本进程的标准输出。
+      为什么不能靠句柄继承：Windows 上 System.Diagnostics.Process 在没有任何
+      重定向时不设置 bInheritHandles，子进程拿不到调用方（PowerShell 捕获用的）
+      管道句柄，输出会直接丢掉（CI 实测：退出码正常、输出为空）。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$File,
@@ -128,6 +133,7 @@ function Start-ShkProcess {
         [switch]$RedirectIn,
         [byte[]]$StdinBytes = $null,
         [switch]$Capture,
+        [switch]$Interactive,
         [int]$TimeoutSec = 0
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -140,6 +146,7 @@ function Start-ShkProcess {
     } else {
         $psi.Arguments = (($ArgList | ForEach-Object { ConvertTo-ShkArg $_ }) -join ' ')
     }
+    $streamMode = $false
     if ($RedirectIn) { $psi.RedirectStandardInput = $true }
     if ($Capture) {
         $psi.RedirectStandardOutput = $true
@@ -148,6 +155,10 @@ function Start-ShkProcess {
             $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false
             $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding $false
         }
+    } elseif (-not $Interactive) {
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $streamMode = $true
     }
     $p = [System.Diagnostics.Process]::Start($psi)
     if ($RedirectIn) {
@@ -157,6 +168,16 @@ function Start-ShkProcess {
         }
         try { $s.Flush() } catch { }
         try { $s.Close() } catch { }
+    }
+    if ($streamMode) {
+        # 两路并发泵：只读一路会在另一路满缓冲时死锁
+        $tOut = $p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())
+        $tErr = $p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())
+        $p.WaitForExit()
+        # [void] 必须留：GetResult() 的返回值会混进函数输出，把 exit 码变成数组
+        try { [void]$tOut.GetAwaiter().GetResult() } catch { }
+        try { [void]$tErr.GetAwaiter().GetResult() } catch { }
+        return $p.ExitCode
     }
     if ($Capture) {
         $out = $p.StandardOutput.ReadToEndAsync()

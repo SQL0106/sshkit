@@ -203,7 +203,7 @@ if ($mode -eq 'file') {
     $body = [Text.Encoding]::UTF8.GetString($bytes)
 } elseif ($i -ge $a.Count) {
     # 交互
-    exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName))
+    exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName) -Interactive)
 } else {
     $body = ($a[$i..($a.Count - 1)] -join ' ')
 }

@@ -153,9 +153,9 @@ if ($cmdWords.Count -eq 0) {
         [Console]::Error.WriteLine("rsh: --sess 是非交互会话，交互请直接 rsh $hostName")
         exit 2
     }
-    if ($native) { exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName)) }
+    if ($native) { exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName) -Interactive) }
     exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName,
-        'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi'))
+        'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi') -Interactive)
 }
 
 exit (Invoke-RshExec ($cmdWords -join ' '))
