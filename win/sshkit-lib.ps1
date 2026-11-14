@@ -351,6 +351,7 @@ function Connect-ShkSess {
         }
         if ($NoStart) { return $null }
         if (-not $spawned) {
+            Trace-ShkSess 'no endpoint -> spawn'
             Start-ShkSessKeeper -HostName $HostName
             $spawned = $true
         }

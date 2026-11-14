@@ -207,7 +207,9 @@ if ($mode -eq 'file') {
     $body = ($a[$i..($a.Count - 1)] -join ' ')
 }
 
+Trace-ShkSess "wsh: detecting shell for $hostName"
 $defKind = Get-WshRemoteShellKind $hostName
+Trace-ShkSess "wsh: defKind=$defKind"
 if ($null -eq $defKind) {
     [Console]::Error.WriteLine("wsh: 无法判断 $hostName 的默认 shell（既不是 PowerShell 也不是 cmd）")
     [Console]::Error.WriteLine("     可显式指定：wsh --shell cmd|pwsh|ps5 $hostName '<命令>'")

@@ -142,8 +142,13 @@ if ($WinHostName -and -not $SkipSsh) {
     Check 'wsh stdin 透传' ($stdinOut -match 'got=PIPED-WIN') $stdinOut
 
     if (-not $NoSess) {
-        $out = & $exe -NoProfile -File $wsh $WinHostName 'echo "via-sess"' 2>&1
-        Check 'wsh 默认(sess) 执行' (($out -join "`n") -match 'via-sess') ($out -join ' | ')
+        # 流式打印（不聚到变量里）：卡住时日志能看到最后的 trace 行
+        $sessOut = @()
+        & $exe -NoProfile -File $wsh $WinHostName '2+2' 2>&1 | ForEach-Object {
+            $sessOut += [string]$_
+            [Console]::Out.WriteLine("    sess| $_")
+        }
+        Check 'wsh 默认(sess) 执行' (($sessOut -join "`n") -match '4') ($sessOut -join ' | ')
 
         & $exe -NoProfile -File $sess run $WinHostName 'Set-Location $env:SystemRoot' 2>&1 | Out-Null
         $where = & $exe -NoProfile -File $sess run $WinHostName '(Get-Location).Path' 2>&1
