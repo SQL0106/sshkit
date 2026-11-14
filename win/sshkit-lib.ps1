@@ -529,7 +529,7 @@ function Send-ShkSessScript($Stream, [string]$Token, [string]$Text) {
 function Trace-ShkSess([string]$Msg) {
     # SSHKIT_SESS_TRACE=1 时打印带毫秒时间戳的阶段标记（排障用，平时零开销）
     if ($env:SSHKIT_SESS_TRACE -eq '1') {
-        [Console]::Error.WriteLine(('sess[%s] %s' -f (Get-Date -Format 'HH:mm:ss.fff'), $Msg))
+        [Console]::Error.WriteLine(('sess[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss.fff'), $Msg))
     }
 }
 

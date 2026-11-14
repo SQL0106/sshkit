@@ -241,9 +241,12 @@ public class SessKeeper
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         psi.Arguments = BuildSshArgs();
+        Log("spawn: before Process.Start");
         proc = Process.Start(psi);
+        Log("spawn: after Process.Start pid=" + proc.Id);
         psin = proc.StandardInput.BaseStream;
         Reset();
+        Log("spawn: streams ready");
 
         bool[] ready = new bool[] { kind == "posix" };
         ManualResetEvent ev = new ManualResetEvent(ready[0]);
@@ -299,10 +302,13 @@ public class SessKeeper
 
         if (kind != "posix")
         {
+            Log("spawn: waiting __READY__");
             if (!ev.WaitOne(ReadyTimeoutSec * 1000))
             {
+                Log("spawn: READY timeout");
                 throw new Exception("远端会话未就绪: " + host);
             }
+            Log("spawn: READY seen");
         }
         else
         {
