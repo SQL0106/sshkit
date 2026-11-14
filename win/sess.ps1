@@ -437,6 +437,7 @@ public class SessKeeper
             try { code = int.Parse(codeS); } catch { code = 1; }
             bufs[stream] = Sub(buf, nl + 1, buf.Length - nl - 1);
             if (stream == "out") { rc = code; outDone = true; }
+            Log("sentinel " + stream + " rc=" + code + " pending=" + pending.Count);
             pending.Remove(stream);
             if (pending.Count == 0) Push(new object[] { "R", rc });
         }
@@ -517,17 +518,27 @@ public class SessKeeper
             }
             int code = 1;
             bool clientLost = false;
+            bool desync = false;
             try
             {
                 while (true)
                 {
                     // 1s 一跳：既给 stderr 哨兵留宽限，也用来发现「客户端已经走了」。
                     // 否则远端一条不回的命令会把 keeper 永久卡在 Take 里。
-                    object[] item = Take(1000);
+                    object[] item = Take(2000);
                     if (item == null)
                     {
                         if (ClientGone(ns)) { clientLost = true; break; }
-                        lock (bufLock) { if (outDone) break; }
+                        bool od = false; int curRc = 1;
+                        lock (bufLock) { od = outDone; curRc = rc; }
+                        if (od)
+                        {
+                            // stdout 哨兵已到、stderr 哨兵没来（Windows 实测会这样）：
+                            // 用 stdout 里的真实 rc，别用初始值 1；这个会话算错位，重建。
+                            code = curRc;
+                            desync = true;
+                            break;
+                        }
                         continue;
                     }
                     if ((string)item[0] == "R") { code = (int)item[1]; break; }
@@ -544,7 +555,13 @@ public class SessKeeper
                 return;
             }
             lock (bufLock) { q = null; }
-            Log("cmd done rc=" + code + (clientLost ? " (client gone)" : ""));
+            Log("cmd done rc=" + code + (clientLost ? " (client gone)" : "") + (desync ? " (stderr sentinel missing -> respawn)" : ""));
+            if (desync)
+            {
+                // 远端 stderr 里可能还有上一条命令的残留：重建会话，保证下一条干净
+                dead = true;
+                try { proc.Kill(); } catch { }
+            }
             if (clientLost)
             {
                 // 客户端半途走了：远端可能还在跑，杀掉会话避免下一条命令错位
