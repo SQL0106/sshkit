@@ -160,6 +160,22 @@ jobs:
             -ArgumentList @('-NoProfile', '-File', 'win/sess.ps1', 'run', 'localhost', '2+2') `
             -PassThru -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e
           if (-not $p.WaitForExit(40000)) { $p.Kill(); Write-Host 'TIMEOUT(40s): sess run 未返回' }
+          Write-Host '--- 双流探针：PowerShell 的 stderr 能到 ssh 的 stderr 通道吗 ---'
+          $pi = New-Object System.Diagnostics.ProcessStartInfo
+          $pi.FileName = 'ssh'
+          $pi.UseShellExecute = $false
+          $pi.RedirectStandardOutput = $true
+          $pi.RedirectStandardError = $true
+          foreach ($x in @('localhost', '& { [Console]::Error.WriteLine("ERRLINE"); [Console]::Out.WriteLine("OUTLINE") }')) {
+            $pi.ArgumentList.Add($x)
+          }
+          $pp = [System.Diagnostics.Process]::Start($pi)
+          $o2 = $pp.StandardOutput.ReadToEndAsync()
+          $e2 = $pp.StandardError.ReadToEndAsync()
+          $pp.WaitForExit()
+          Write-Host ("  OUT=[" + $o2.Result.Trim() + "]")
+          Write-Host ("  ERR=[" + $e2.Result.Trim() + "]")
+
           Write-Host '--- sess stdout ---'
           Get-Content $o -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
           Write-Host '--- sess stderr（含 trace） ---'

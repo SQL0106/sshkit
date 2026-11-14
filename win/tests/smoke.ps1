@@ -150,8 +150,12 @@ if ($WinHostName -and -not $SkipSsh) {
         }
         Check 'wsh 默认(sess) 执行' (($sessOut -join "`n") -match '4') ($sessOut -join ' | ')
 
-        & $exe -NoProfile -File $sess run $WinHostName 'Set-Location $env:SystemRoot' 2>&1 | Out-Null
-        $where = & $exe -NoProfile -File $sess run $WinHostName '(Get-Location).Path' 2>&1
+        & $exe -NoProfile -File $sess run $WinHostName 'Set-Location $env:SystemRoot' 2>&1 | ForEach-Object { [Console]::Out.WriteLine("    sess| $_") }
+        $where = @()
+        & $exe -NoProfile -File $sess run $WinHostName '(Get-Location).Path' 2>&1 | ForEach-Object {
+            $where += [string]$_
+            [Console]::Out.WriteLine("    sess| $_")
+        }
         Check 'sess(windows) 状态保持' (($where -join '') -match [regex]::Escape($env:SystemRoot)) ($where -join ' ')
         & $exe -NoProfile -File $sess stop $WinHostName 2>&1 | Out-Null
 
