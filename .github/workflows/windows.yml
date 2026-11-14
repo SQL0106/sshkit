@@ -86,6 +86,32 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1
 
+      - name: 探针（ssh 输出捕获是否正常）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host '--- 1) 本地 pwsh 直接输出 ---'
+          $o = & pwsh -NoProfile -Command '"hello-from-ps"'
+          Write-Host "captured=[$o]"
+
+          Write-Host '--- 2) ssh 直接输出（不捕获） ---'
+          ssh localhost '"hello-from-ssh"'
+          Write-Host "rc=$LASTEXITCODE"
+
+          Write-Host '--- 3) ssh 直接输出（捕获） ---'
+          $o = ssh localhost '"hello-from-ssh"'
+          Write-Host "captured=[$o] rc=$LASTEXITCODE"
+
+          Write-Host '--- 4) 经 wsh --direct ---'
+          $o = & pwsh -NoProfile -File win/wsh.ps1 --direct localhost '"hello-from-wsh"'
+          Write-Host "captured=[$o] rc=$LASTEXITCODE"
+
+          Write-Host '--- 5) wsh 脚本内部构造 ---'
+          $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('"hello-raw"'))
+          $expr = "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b'))))"
+          $o = ssh localhost $expr
+          Write-Host "captured=[$o] rc=$LASTEXITCODE"
+
       - name: 联机用例·一次性 ssh（不依赖 sess）
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1 -WinHostName localhost -NoSess
