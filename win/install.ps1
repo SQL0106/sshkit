@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # install.ps1 —— 把 sshkit 的 PowerShell 版装进 Windows
 #
 #   pwsh -NoProfile -File win/install.ps1            # 装到 %LOCALAPPDATA%\sshkit

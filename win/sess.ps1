@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # sess.ps1 —— 常驻远端 shell 会话（Windows / PowerShell 版）
 #
 # 用法：

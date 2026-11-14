@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # rsh.ps1 —— POSIX 目标（Linux / macOS / Android）的 ssh 外壳（Windows / PowerShell 版）
 #
 # 用法：

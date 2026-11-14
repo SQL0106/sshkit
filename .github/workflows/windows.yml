@@ -22,6 +22,8 @@ jobs:
     env:
       # CI 里不许无限等：20s 内连第一帧都收不到就判定会话坏了
       SSHKIT_SESS_FIRST_BYTE: '20'
+      # 阶段跟踪：卡住时能从日志看出停在哪一步
+      SSHKIT_SESS_TRACE: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -155,7 +157,7 @@ jobs:
           $o = Join-Path $env:RUNNER_TEMP 'sess.out'
           $e = Join-Path $env:RUNNER_TEMP 'sess.err'
           $p = Start-Process -FilePath $exe `
-            -ArgumentList @('-NoProfile', '-File', 'win/sess.ps1', 'run', 'localhost', '"hello-sess"') `
+            -ArgumentList @('-NoProfile', '-File', 'win/sess.ps1', 'run', 'localhost', '2+2') `
             -PassThru -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e
           if (-not $p.WaitForExit(40000)) { $p.Kill(); Write-Host 'TIMEOUT(40s): sess run 未返回' }
           Write-Host '--- sess stdout ---'

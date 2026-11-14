@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # smoke.ps1 —— PowerShell 版 sshkit 自测
 #
 #   pwsh -NoProfile -File win/tests/smoke.ps1                     # 只跑本机可离线验证的部分

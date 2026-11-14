@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # wsh.ps1 —— Windows 目标的 ssh 外壳（Windows / PowerShell 版）
 #
 # 用法：

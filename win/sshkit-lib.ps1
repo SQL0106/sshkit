@@ -1,4 +1,4 @@
-# sshkit-lib.ps1 —— sshkit PowerShell 版共享实现（客户端侧）
+﻿# sshkit-lib.ps1 —— sshkit PowerShell 版共享实现（客户端侧）
 #
 # 被 rsh.ps1 / wsh.ps1 / sess.ps1 dot-source，不单独执行。
 #
