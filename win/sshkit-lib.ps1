@@ -370,18 +370,25 @@ function Send-ShkSessFrame($Stream, [byte]$Kind, [byte[]]$Data) {
     $Stream.Flush()
 }
 
-function Read-ShkSessFrames($Stream, [int]$TimeoutMs = 0) {
-    # 读帧直到 R（退出码）；返回退出码，或 $null（连接断了/超时）
+function Read-ShkSessFrames($Stream, [int]$FirstByteTimeoutMs = 0) {
+    # 读帧直到 R（退出码）；返回退出码，或 $null（连接断了/首字节超时）
+    # 只有**首字节**受超时约束：命令本身可以长时间不输出，不能一刀切。
     $stdout = [Console]::OpenStandardOutput()
     $stderr = [Console]::OpenStandardError()
-    if ($TimeoutMs -gt 0) {
-        try { $Stream.ReadTimeout = $TimeoutMs } catch { }
+    $armed = $FirstByteTimeoutMs -gt 0
+    if ($armed) {
+        try { $Stream.ReadTimeout = $FirstByteTimeoutMs } catch { $armed = $false }
     }
     $hdr = New-Object byte[] 5
     while ($true) {
         $n = 0
         try { $n = Read-ShkExact $Stream $hdr 5 } catch { return $null }
         if ($n -lt 5) { return $null }
+        if ($armed) {
+            # 已经看到数据：解除超时，长命令可以慢慢跑
+            $armed = $false
+            try { $Stream.ReadTimeout = [System.Threading.Timeout]::Infinite } catch { }
+        }
         $kind = [char]$hdr[0]
         $len = ([int]$hdr[1] -shl 24) -bor ([int]$hdr[2] -shl 16) -bor ([int]$hdr[3] -shl 8) -bor [int]$hdr[4]
         $buf = New-Object byte[] $len
@@ -520,9 +527,13 @@ function Invoke-ShkSessRun {
             [Console]::Error.WriteLine("sess: 发送失败 $HostName")
             return 1
         }
-        $rc = Read-ShkSessFrames $s 0
+        $fb = 120
+        if ($env:SSHKIT_SESS_FIRST_BYTE) {
+            try { $fb = [int]$env:SSHKIT_SESS_FIRST_BYTE } catch { }
+        }
+        $rc = Read-ShkSessFrames $s ($fb * 1000)
         if ($null -eq $rc) {
-            [Console]::Error.WriteLine("sess: $HostName 会话无响应（可能刚被关闭），可用 --new 重建")
+            [Console]::Error.WriteLine("sess: $HostName 会话无响应（首字节 ${fb}s 超时或连接断开），可用 --new 重建；日志：$((Get-ShkSessPaths $HostName).Log)")
             return 1
         }
         return $rc

@@ -12,7 +12,9 @@ param(
     [string]$HostName = '',
     # Windows 目标：跑 wsh + sess(windows loop) 用例
     [string]$WinHostName = '',
-    [switch]$SkipSsh
+    [switch]$SkipSsh,
+    # 跳过 sess 用例（只验一次性 ssh 路径）
+    [switch]$NoSess
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -107,8 +109,9 @@ if ($WinHostName -and -not $SkipSsh) {
     $sess = Join-Path $root 'sess.ps1'
     $exe = Get-ShkPowerShellExe
 
-    $out = & $exe -NoProfile -File $wsh $WinHostName 'echo "win-ok"' 2>&1
-    Check 'wsh 默认(sess) 执行' (($out -join "`n") -match 'win-ok') ($out -join ' | ')
+    # 先测不依赖 sess 的一次性路径：sess 出问题时能立刻区分「wsh 本身坏了」
+    $out = & $exe -NoProfile -File $wsh --direct $WinHostName 'echo "win-ok"' 2>&1
+    Check 'wsh --direct 执行' (($out -join "`n") -match 'win-ok') ($out -join ' | ')
 
     $out = & $exe -NoProfile -File $wsh --direct $WinHostName '"中文-" + (1+1)' 2>&1
     Check 'wsh --direct 中文' (($out -join "`n") -match '中文-2') ($out -join ' | ')
@@ -116,10 +119,21 @@ if ($WinHostName -and -not $SkipSsh) {
     & $exe -NoProfile -File $wsh --direct $WinHostName 'exit 7' 2>&1 | Out-Null
     Check 'wsh 退出码 7' ($LASTEXITCODE -eq 7) "rc=$LASTEXITCODE"
 
-    & $exe -NoProfile -File $sess run $WinHostName 'Set-Location $env:SystemRoot' 2>&1 | Out-Null
-    $where = & $exe -NoProfile -File $sess run $WinHostName '(Get-Location).Path' 2>&1
-    Check 'sess(windows) 状态保持' (($where -join '') -match [regex]::Escape($env:SystemRoot)) ($where -join ' ')
-    & $exe -NoProfile -File $sess stop $WinHostName 2>&1 | Out-Null
+    if (-not $NoSess) {
+        $out = & $exe -NoProfile -File $wsh $WinHostName 'echo "via-sess"' 2>&1
+        Check 'wsh 默认(sess) 执行' (($out -join "`n") -match 'via-sess') ($out -join ' | ')
+
+        & $exe -NoProfile -File $sess run $WinHostName 'Set-Location $env:SystemRoot' 2>&1 | Out-Null
+        $where = & $exe -NoProfile -File $sess run $WinHostName '(Get-Location).Path' 2>&1
+        Check 'sess(windows) 状态保持' (($where -join '') -match [regex]::Escape($env:SystemRoot)) ($where -join ' ')
+        & $exe -NoProfile -File $sess stop $WinHostName 2>&1 | Out-Null
+
+        $lg = Join-Path (Get-ShkCache 'sess') ($WinHostName + '.v4.log')
+        if (Test-Path -LiteralPath $lg) {
+            [Console]::Out.WriteLine('--- sess 日志（尾部）---')
+            Get-Content -LiteralPath $lg -Tail 10 | ForEach-Object { [Console]::Out.WriteLine("    $_") }
+        }
+    }
 }
 
 if ($HostName -and -not $SkipSsh) {

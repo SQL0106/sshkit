@@ -19,6 +19,9 @@ jobs:
   smoke:
     runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      # CI 里不许无限等：20s 内连第一帧都收不到就判定会话坏了
+      SSHKIT_SESS_FIRST_BYTE: '20'
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +86,11 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1
 
-      - name: 联机用例（pwsh 7 → 本地 pwsh，走 wsh + sess 的 Windows 路径）
+      - name: 联机用例·一次性 ssh（不依赖 sess）
+        shell: pwsh
+        run: pwsh -NoProfile -File win/tests/smoke.ps1 -WinHostName localhost -NoSess
+
+      - name: 联机用例·sess
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1 -WinHostName localhost
 

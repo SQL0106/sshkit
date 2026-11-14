@@ -495,14 +495,20 @@ public class SessKeeper
                 return;
             }
             int code = 1;
+            bool clientLost = false;
             try
             {
                 while (true)
                 {
-                    bool grace = false;
-                    lock (bufLock) { grace = outDone; }
-                    object[] item = Take(grace ? 300 : -1);
-                    if (item == null) break;
+                    // 1s 一跳：既给 stderr 哨兵留宽限，也用来发现「客户端已经走了」。
+                    // 否则远端一条不回的命令会把 keeper 永久卡在 Take 里。
+                    object[] item = Take(1000);
+                    if (item == null)
+                    {
+                        if (ClientGone(ns)) { clientLost = true; break; }
+                        lock (bufLock) { if (outDone) break; }
+                        continue;
+                    }
                     if ((string)item[0] == "R") { code = (int)item[1]; break; }
                     SendFrame(ns, (byte)(((string)item[0] == "O") ? 'O' : 'E'), (byte[])item[1]);
                 }
@@ -517,6 +523,14 @@ public class SessKeeper
                 return;
             }
             lock (bufLock) { q = null; }
+            if (clientLost)
+            {
+                // 客户端半途走了：远端可能还在跑，杀掉会话避免下一条命令错位
+                Log("client gone -> kill session");
+                dead = true;
+                try { proc.Kill(); } catch { }
+                return;
+            }
             try { SendFrame(ns, (byte)'R', I32(code)); }
             catch { dead = true; try { proc.Kill(); } catch { } }
             lastUsed = DateTime.UtcNow;
@@ -554,6 +568,16 @@ public class SessKeeper
         byte[] r = new byte[count];
         Array.Copy(a, start, r, 0, count);
         return r;
+    }
+
+    private static bool ClientGone(NetworkStream ns)
+    {
+        try
+        {
+            // 可读但没数据 = 对端已关闭
+            return ns.Socket.Poll(0, SelectMode.SelectRead) && ns.Socket.Available == 0;
+        }
+        catch { return true; }
     }
 
     private static int IndexOf(byte[] hay, byte[] needle, int from)
