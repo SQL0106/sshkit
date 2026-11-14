@@ -303,6 +303,7 @@ function Start-ShkSessKeeper {
     param([string]$HostName, [string]$Kind = '')
     if (-not $Kind) { $Kind = Get-ShkSessKind $HostName }
     $remote = Get-ShkSessRemoteCommand $HostName $Kind
+    Trace-ShkSess "spawn keeper exe=$(Get-ShkPowerShellExe) kind=$Kind"
     $sess = Join-Path $script:ShkHome 'sess.ps1'
     $exe = Get-ShkPowerShellExe
     $a = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $sess,
@@ -321,6 +322,7 @@ function Start-ShkSessKeeper {
         $psi.Arguments = (($a | ForEach-Object { ConvertTo-ShkArg $_ }) -join ' ')
     }
     [System.Diagnostics.Process]::Start($psi) | Out-Null
+    Trace-ShkSess 'keeper spawned'
     # 指纹由拉起方写：keeper 只负责跑协议，源码变更检测归客户端
     try { Set-Content -LiteralPath (Get-ShkSessPaths $HostName).Sig -Value (Get-ShkSessSig) -Encoding ascii } catch { }
 }
@@ -524,8 +526,16 @@ function Send-ShkSessScript($Stream, [string]$Token, [string]$Text) {
     $Stream.Flush()
 }
 
+function Trace-ShkSess([string]$Msg) {
+    # SSHKIT_SESS_TRACE=1 时打印带毫秒时间戳的阶段标记（排障用，平时零开销）
+    if ($env:SSHKIT_SESS_TRACE -eq '1') {
+        [Console]::Error.WriteLine(('sess[%s] %s' -f (Get-Date -Format 'HH:mm:ss.fff'), $Msg))
+    }
+}
+
 function Invoke-ShkSessRun {
     param([string]$HostName, [string]$Script, [switch]$New, [switch]$Verbose)
+    Trace-ShkSess "run start host=$HostName"
     if ($New) {
         Stop-ShkSess -HostName $HostName -Quiet -Force
         Wait-ShkSessGone $HostName 5 | Out-Null
@@ -535,7 +545,9 @@ function Invoke-ShkSessRun {
         Stop-ShkSess -HostName $HostName -Quiet -Force
         Wait-ShkSessGone $HostName 5 | Out-Null
     }
+    Trace-ShkSess 'health ok, connecting'
     $conn = Connect-ShkSess -HostName $HostName
+    Trace-ShkSess ('connect -> ' + $(if ($null -eq $conn) { 'null' } else { 'ok' }))
     if ($null -eq $conn) {
         [Console]::Error.WriteLine("sess: 连不上会话 $HostName（日志：$((Get-ShkSessPaths $HostName).Log)）")
         return 1
@@ -552,7 +564,9 @@ function Invoke-ShkSessRun {
         if ($env:SSHKIT_SESS_FIRST_BYTE) {
             try { $fb = [int]$env:SSHKIT_SESS_FIRST_BYTE } catch { }
         }
+        Trace-ShkSess "sent, reading frames (first-byte timeout ${fb}s)"
         $rc = Read-ShkSessFrames $s ($fb * 1000)
+        Trace-ShkSess "frames done rc=$rc"
         if ($null -eq $rc) {
             [Console]::Error.WriteLine("sess: $HostName 会话无响应（首字节 ${fb}s 超时或连接断开），可用 --new 重建；日志：$((Get-ShkSessPaths $HostName).Log)")
             return 1
