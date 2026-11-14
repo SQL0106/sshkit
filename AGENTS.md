@@ -10,6 +10,7 @@
 - `bin/ssh-unlock`：幂等解锁 ssh-agent（未解锁时用 `$SSH_PASS` 自动 `ssh-add`，不落盘）。
 - `systemd/ssh-agent.service`：user unit，`ExecStart=/usr/bin/ssh-agent -D -a %h/.ssh/agent.sock`。
 - `install.sh`：`--agent` 装 agent unit。
+- `win/`：**PowerShell 版（Windows 客户端，原生；不依赖 WSL/Git Bash/Python）**。`rsh.ps1` / `wsh.ps1` / `sess.ps1` 的命令行与 POSIX 版一致（`rsh` 的 `-C/-c/-R` 容器包装除外，会报错提示）；`sshkit-lib.ps1` 是共享实现（native 进程调用、sess v4 客户端、kind 探测）；`install.ps1` 装到 `%LOCALAPPDATA%\sshkit`（脚本 + `bin\*.cmd` 入口 + PowerShell profile 函数）；`win/tests/smoke.ps1` 是自测；`.github/workflows/windows.yml` 在 `windows-latest` 上开本地 sshd 做真机验证。
 
 ## 约定
 - **改这四个工具请在本仓库改，push 后再拷到 `~/.local/bin`**（不要直接改 `~/.local/bin`）。
@@ -36,6 +37,9 @@
 - `sess kind` 类型缓存会中毒（`~/.cache/sess/<host>.kind` 被存成 `windows`）：表现为 rc=1 且**零输出**、日志 `write failed: BrokenPipeError`。修法 `sess kind --reset <host>` 或删缓存 + `sess stop <host>`。探测失败不再落缓存，写管道失败会自动 respawn 重试一次。
 - Windows OpenSSH 下**嵌套 `pwsh`/`cmd` 的退出码一律被吞成 1**（只有本进程 `exit` 才透传）→ 别用 `ssh win 'powershell -Command ...'`；`-Command -` 读 stdin 也是 rc=1。`wsh` 已在脚本尾部显式 `exit` 并按需回传 `$LASTEXITCODE`，且设 `$PSStyle.OutputRendering='PlainText'`、强制 UTF-8。
 - 命令长度上限约 20KB（base64 后），更大先 scp 上去再执行。
+- **Windows 版铁律：ssh 的 argv 里绝不能出现引号**。PS 5.1 的原生参数传递（Legacy）会破坏含双引号的参数，所以用户命令一律本地 base64：`rsh` → 远端 `mktemp` 脚本（执行后删除），`wsh` → `& ([scriptblock]::Create(...))` 或 `xxx.exe -NoProfile -EncodedCommand`。改这块前先读 `win/sshkit-lib.ps1` 顶部三条约束。
+- **Windows sess 是 v4 协议**：`127.0.0.1` 随机端口 + 随机 token + `<token>\n<字节数>\n<script>` 请求帧，状态文件 `<host>.v4.*`（与 POSIX 的 v3 unix socket 共存）。keeper 由 `Add-Type` 编译 C# 实现，**拉起时必须 `RedirectStandardOutput/Error`**（否则 keeper 持有调用方管道，`rsh ... | tail` 永不结束），单实例靠 `FileShare.Read` 锁文件；`sess stop` 必须走长度前缀帧（早期写错格式会导致「停不掉 + 删了端口文件 + 锁互斥卡死」）。
+- Windows 版**不做**远端 ssh-agent 自愈前导，**不支持** droidspaces 容器包装（`-C/-c/-R`）。Windows OpenSSH 客户端也不支持 `ControlMaster`，复用连接只能靠 sess。
 
 ## 性能参考（本机实测）
 - Linux：`ssh` 有 ControlMaster 时 16ms，`sess` 44ms → **单条命令直接 ssh/rsh，批处理/需要状态才用 sess**。

@@ -11,7 +11,7 @@ sshkit 把这两件事一起解决了：
 - **`sess`** —— 常驻远端会话：`cd`、环境变量、函数跨命令保留，一条命令固定 ~45ms（Windows 从 400ms 降到 47ms）。
 - **`ssh-unlock`** —— 幂等解锁常驻 ssh-agent，口令只经环境变量过一遍，不落盘。
 
-零第三方依赖：三个 POSIX sh 脚本 + 一个 Python 3 标准库脚本。
+零第三方依赖：三个 POSIX sh 脚本 + 一个 Python 3 标准库脚本；Windows 侧是四个 PowerShell 脚本（同样的零依赖）。
 
 ```
 bin/rsh           POSIX 目标外壳（bash 语义 + base64 传输）
@@ -20,6 +20,7 @@ bin/sess          常驻会话守护（每 host 一个 keeper + unix socket）
 bin/ssh-unlock    无交互解锁 ssh-agent
 systemd/ssh-agent.service
 install.sh
+win/              PowerShell 版（Windows 客户端）：rsh / wsh / sess / install
 ```
 
 ## 30 秒上手
@@ -58,6 +59,64 @@ rsh --sess linux-host 'cd /var/log; pwd'   # 下一条命令仍在 /var/log
 3. `wsh` 默认走 sess。**唯一的故障模式是 keeper 变陈旧**（现象：每条命令几十秒，实测过 147 s）。诊断只需两步：`sess run <host> 1` 连跑两次看第二次耗时 → 慢就 `sess stop <host>` 重建，之后再试一次。**不要因此退回裸 ssh。**
 4. 觉得慢或行为怪 → `sess stop <host>` 让它重建，再测；不要退回裸 ssh。
 5. 批量/长脚本优先 `-f <脚本>`，别把几十行塞进命令行（20 KB 上限）。
+
+## Windows 客户端（PowerShell 版）
+
+同一套工具的 PowerShell 实现，**在本机 Windows 上原生运行**：不需要 WSL、Git Bash 或 Python，只依赖系统自带的 PowerShell + OpenSSH 客户端。
+
+```
+win/rsh.ps1           POSIX 目标（Linux/macOS/Android）
+win/wsh.ps1           Windows 目标（pwsh / 5.1 / cmd）
+win/sess.ps1          常驻会话（客户端 + C# keeper，Add-Type 现场编译）
+win/sshkit-lib.ps1    共享实现（native 进程调用、sess 协议、kind 探测）
+win/install.ps1       安装到 %LOCALAPPDATA%\sshkit
+win/tests/smoke.ps1   自测（离线用例 + 可选真机用例）
+```
+
+```powershell
+git clone https://github.com/SQL0106/sshkit.git; cd sshkit
+pwsh -NoProfile -File win/install.ps1      # 装脚本 + cmd 入口 + profile 函数
+
+rsh linux-host 'uname -a'
+wsh win-host '$PSVersionTable.PSVersion.ToString()'
+rsh --sess linux-host 'cd /var/log; pwd'
+```
+
+三种入口，效果相同：
+
+| 入口 | 形态 | 适用 |
+|---|---|---|
+| profile 里的 `rsh` / `wsh` / `sess` 函数 | 参数原样 splat（推荐） | 交互式 PowerShell、agent 在 PS 里调用 |
+| `%LOCALAPPDATA%\sshkit\bin\*.cmd` | cmd.exe 转发 `%*` | cmd.exe / 不认 PowerShell profile 的调用方 |
+| `pwsh -NoProfile -File <path>\rsh.ps1 ...` | 一次性进程 | 脚本里显式调用 |
+
+Windows 自带的 `rsh.exe`（老 Remote Shell 协议）与本工具同名：PowerShell 里函数优先，cmd.exe 里则取决于 PATH 顺序。
+
+**与 POSIX 版的关键差异（都是实测后有意为之）**
+
+1. **命令不进 ssh 的 argv**：命令在本地 base64，远端用 `mktemp` 落一个脚本、执行、立即删除。PowerShell 5.1 的原生参数传递（Legacy 模式）对含双引号的参数有破坏性转义，任何「把命令拼进 ssh 参数」的写法在 5.1 上都不可靠。四种候选传输方式实测下来，唯一「零引号 + 保住 stdin」的形态就是它。
+2. **stdin 仍属于用户命令**：`echo x | rsh host 'cat'` 照常工作（把脚本塞进 stdin 的写法会吃掉它）。
+3. **不做远端 ssh-agent 自愈前导**：那是 Linux 客户端之间的约定，Windows 侧用法不同。PATH 前置 `~/.local/bin` 仍保留。
+4. **不实现 droidspaces 容器包装**（`-C` / `-c` / `-R`）：遇到直接报错，提示改用容器自己的 ssh 别名。
+5. 脚本以临时文件路径作为 `$0`（POSIX 版是 `bash`），依赖 `$0` 名字的脚本要注意。
+
+**sess 的 Windows 版**：协议升级为 v4（`127.0.0.1` 上随机端口 + 随机 token + 长度前缀请求帧），状态文件是 `<host>.v4.*`，与 POSIX 版的 v3 unix socket **互不干扰、可共存**。keeper 是独立进程，用 `Add-Type` 现场编译一段 C#（PowerShell 自身没有可靠的双管道并发 I/O）；单实例由 `FileShare.Read` 锁文件保证；keeper 的 stdout/stderr 由拉起方重定向，不会挂住调用方的管道。
+
+**性能**（Fedora + pwsh 7.6，真连一台 Linux 主机实测，非 Windows 硬件）：
+
+| 方式 | 每条命令 |
+|---|---|
+| `rsh`（一次性 ssh） | 0.8–1.5 s，其中 pwsh 启动约 0.4 s |
+| `sess` 首条（编译 + 起 keeper） | ~2.8 s |
+| `sess` 后续 | 0.9–1.0 s（仍是 pwsh 启动占大头） |
+
+结论：**每次一个进程的 `.ps1` 入口，开销主要是 PowerShell 自身启动**。要压掉这部分就用 profile 函数，在同一个会话里连续调用。
+
+**验证状态**
+
+- 已实测（Fedora + pwsh 7.6 → 真 Linux 主机）：`rsh` 执行/退出码/stdin 透传/`-f`/`-n`/`-s`、`sess` 状态保持与停止、`wsh` 跨解释器（`pwsh.exe -EncodedCommand`）路径。
+- 真 Windows 由 CI 验证（`.github/workflows/windows.yml`：`windows-latest` 上开本地 sshd、DefaultShell=pwsh，真跑 `wsh`/`sess`/`--shell cmd`/`--shell ps5`/中文/退出码/安装脚本，并用 Windows PowerShell 5.1 跑同一套离线用例）。
+- 未覆盖：Windows 上带口令私钥的 ssh-agent 交互；远端默认 shell 为 cmd 时没有 sess（协议不支持，自动回落一次性 ssh）。
 
 ## rsh
 
