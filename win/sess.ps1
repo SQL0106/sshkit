@@ -126,12 +126,14 @@ public class SessKeeper
         srv.Start();
         Log("listening");
         int port = ((IPEndPoint)srv.LocalEndpoint).Port;
-        File.WriteAllText(portFile, port.ToString() + "\n" + token + "\n");
         File.WriteAllText(pidFile, Process.GetCurrentProcess().Id.ToString() + "\n");
         Log("keeper up kind=" + kind + " port=" + port);
         try { Spawn(); }
         catch (Exception e) { Log("spawn failed: " + e.Message + " | " + e.StackTrace); throw; }
-        Log("remote session ready");
+        // 端口文件必须在远端就绪**之后**才发布：否则客户端会抢在 Spawn 完成前
+        // 连上并把命令塞进去（TCP backlog 会接受连接），拿到空输出/假退出码。
+        File.WriteAllText(portFile, port.ToString() + "\n" + token + "\n");
+        Log("remote session ready, port published");
 
         while (!killNow)
         {
@@ -178,8 +180,9 @@ public class SessKeeper
         {
             NetworkStream ns = c.GetStream();
             ns.ReadTimeout = 60000;
+            Log("client connected");
             string got = ReadLine(ns);
-            if (got == null || got != token) return;
+            if (got == null || got != token) { Log("bad token"); return; }
             string lenLine = ReadLine(ns);
             if (lenLine == null) return;
             int len = int.Parse(lenLine.Trim());
@@ -541,6 +544,7 @@ public class SessKeeper
                 return;
             }
             lock (bufLock) { q = null; }
+            Log("cmd done rc=" + code + (clientLost ? " (client gone)" : ""));
             if (clientLost)
             {
                 // 客户端半途走了：远端可能还在跑，杀掉会话避免下一条命令错位
