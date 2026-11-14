@@ -18,6 +18,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# 远程输出是 UTF-8；调用方也必须是 UTF-8，否则中文会被码页解成 '??'
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
 
 $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 . (Join-Path $root 'sshkit-lib.ps1')

@@ -95,6 +95,8 @@ if (-not $NoProfile) {
             $block = @(
                 '# >>> sshkit >>>',
                 '# 由 sshkit 的 install.ps1 生成；重装会整段替换，不要手改',
+                '# 远程输出是 UTF-8：捕获输出时按 UTF-8 解码，中文才不乱码',
+                'try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }',
                 "function rsh { & `"$(Join-Path $winDir 'rsh.ps1')`" @args }",
                 "function wsh { & `"$(Join-Path $winDir 'wsh.ps1')`" @args }",
                 "function sess { & `"$(Join-Path $winDir 'sess.ps1')`" @args }",
