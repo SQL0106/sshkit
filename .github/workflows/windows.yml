@@ -31,15 +31,25 @@ jobs:
             Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
           }
 
-          # 一次性密钥
+          # 一次性密钥（-N '' 是真空口令；写成 '""' 会被当成两个字面引号）
           $key = Join-Path $env:RUNNER_TEMP 'ci_key'
           if (Test-Path $key) { Remove-Item $key -Force }
-          & ssh-keygen -t ed25519 -f $key -N '""' -q
+          & ssh-keygen -t ed25519 -f $key -N '' -q
+          if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen 失败' }
+          # 自检：能无口令导出公钥，说明私钥没有 passphrase
+          & ssh-keygen -y -f $key | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '私钥带口令（-N 没生效）' }
 
           # 管理员账号登录走 administrators_authorized_keys（ACL 必须收紧）
-          $ak = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+          $sshProg = Join-Path $env:ProgramData 'ssh'
+          New-Item -ItemType Directory -Force -Path $sshProg | Out-Null
+          $ak = Join-Path $sshProg 'administrators_authorized_keys'
           Copy-Item "$key.pub" $ak -Force
-          icacls $ak /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          icacls $ak /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
+          Write-Host "authorized_keys: $ak"
+          Get-Content $ak | ForEach-Object { Write-Host "  key: $($_.Substring(0, [Math]::Min(40, $_.Length)))..." }
+          Select-String -Path (Join-Path $sshProg 'sshd_config') -Pattern 'AuthorizedKeysFile|Match Group' |
+            ForEach-Object { Write-Host "  config: $($_.Line.Trim())" }
 
           # 默认 shell = pwsh 7：wsh 的 auto 探测和 sess 的 windows loop 都依赖它
           $pwsh = (Get-Command pwsh).Source
@@ -61,7 +71,13 @@ jobs:
           "@ | Set-Content -Path (Join-Path $sshDir 'config') -Encoding ascii
 
           & ssh -o BatchMode=yes localhost 'echo sshd-ok'
-          if ($LASTEXITCODE -ne 0) { throw 'sshd 没起来' }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '--- 诊断 ---'
+            Get-Service sshd | Format-List Name, Status, StartType | Out-String | Write-Host
+            & ssh -vv -o BatchMode=yes localhost 'echo probe' 2>&1 |
+              Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+            throw 'sshd 没起来'
+          }
 
       - name: 离线用例（pwsh 7）
         shell: pwsh
