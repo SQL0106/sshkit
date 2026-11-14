@@ -34,15 +34,14 @@ if (-not (Test-Path -LiteralPath $lib)) {
 . $lib
 Initialize-ShkConsole
 
+# 远端输出必须无条件 UTF-8：Windows 的默认输出码页是 437/936，中文在 437 下
+# 会被编码成 '?'（CI 实测：ssh 通道上收到 3f 3f）。pwsh 7 也**不**自动用 UTF-8。
 $PROLOGUE = @'
 $ProgressPreference="SilentlyContinue"
 $ErrorActionPreference="Continue"
-if ($PSVersionTable.PSVersion.Major -lt 7) {
-    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
-    try { $OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
-} else {
-    try { $PSStyle.OutputRendering = "PlainText" } catch {}
-}
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+try { $OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+try { if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = "PlainText" } } catch {}
 '@
 
 $EPILOGUE = @'
