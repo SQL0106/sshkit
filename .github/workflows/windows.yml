@@ -136,8 +136,43 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1 -WinHostName localhost -NoSess
 
+      - name: 会话诊断（有界，失败也打印 keeper 日志）
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:SSHKIT_SESS_FIRST_BYTE = '15'
+          Write-Host '--- sess kind ---'
+          & pwsh -NoProfile -File win/sess.ps1 kind --reset localhost
+
+          $job = Start-Job -ScriptBlock {
+            Set-Location $using:PWD
+            $env:SSHKIT_SESS_FIRST_BYTE = '15'
+            & pwsh -NoProfile -File win/sess.ps1 run localhost '"hello-sess"' 2>&1
+            "rc=$LASTEXITCODE"
+          }
+          if (Wait-Job $job -Timeout 60) {
+            Receive-Job $job | ForEach-Object { Write-Host $_ }
+          } else {
+            Write-Host 'TIMEOUT: sess run 60s 未返回'
+            Stop-Job $job -ErrorAction SilentlyContinue
+          }
+          Remove-Job $job -Force -ErrorAction SilentlyContinue
+
+          $log = Join-Path $env:USERPROFILE '.cache\sess\localhost.v4.log'
+          if (Test-Path $log) {
+            Write-Host "--- keeper 日志 ---"
+            Get-Content $log -Tail 40 | ForEach-Object { Write-Host $_ }
+          } else {
+            Write-Host "（没有 $log）"
+          }
+          Get-ChildItem (Join-Path $env:USERPROFILE '.cache\sess') -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("  file: " + $_.Name + " " + $_.Length) }
+          & pwsh -NoProfile -File win/sess.ps1 stop localhost
+
       - name: 联机用例·sess
         shell: pwsh
+        timeout-minutes: 6
         run: pwsh -NoProfile -File win/tests/smoke.ps1 -WinHostName localhost
 
       - name: 兼容性（Windows PowerShell 5.1 跑同一套离线用例）
