@@ -112,6 +112,26 @@ jobs:
           $o = ssh localhost $expr
           Write-Host "captured=[$o] rc=$LASTEXITCODE"
 
+          Write-Host '--- 6) 中文：捕获后的字符码 ---'
+          $o = ssh localhost '"中文"'
+          $s = ($o -join '')
+          Write-Host ("len=" + $s.Length + " codes=" + (([int[]][char[]]$s) -join ','))
+
+          Write-Host '--- 7) 中文：原始字节（不经过 PS 解码） ---'
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = 'ssh'
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          foreach ($x in @('localhost', '"中文"')) { $psi.ArgumentList.Add($x) }
+          $p2 = [System.Diagnostics.Process]::Start($psi)
+          $ms = New-Object System.IO.MemoryStream
+          $p2.StandardOutput.BaseStream.CopyTo($ms)
+          $p2.WaitForExit()
+          $bytes = $ms.ToArray()
+          Write-Host ("raw bytes=" + (($bytes | ForEach-Object { $_.ToString('x2') }) -join ' '))
+          Write-Host ("local OutputEncoding=" + [Console]::OutputEncoding.WebName + " cp=" + [Console]::OutputEncoding.CodePage)
+
       - name: 联机用例·一次性 ssh（不依赖 sess）
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1 -WinHostName localhost -NoSess
