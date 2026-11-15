@@ -65,6 +65,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
           @"
           Host localhost win-host
+              HostName localhost
               User $env:USERNAME
               IdentityFile $key
               StrictHostKeyChecking no
