@@ -36,8 +36,9 @@ try { [Console]::SetError([Console]::Out) } catch {}
 while ($true) {
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
-    # Windows PowerShell 5.1 写管道时可能带 UTF-8 BOM，会粘在 token 前面
-    $line = $line.TrimStart([char]0xFEFF)
+    # Windows PowerShell 5.1 写管道时可能带 UTF-8 BOM：按控制台码页解码后会变成
+    # 若干非十六进制字符粘在 token 前面（实测 CP437 下是 ∩╗┐），统一剥掉。
+    $line = [regex]::Replace($line, '^[^0-9A-Fa-f]+', '')
     if ($line.Length -eq 0) { continue }
     $i = $line.IndexOf(":")
     $tok = $line.Substring(0, $i)

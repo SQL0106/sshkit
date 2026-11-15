@@ -219,7 +219,15 @@ public class SessKeeper
             if (one[0] != 13) ms.WriteByte(one[0]);
             if (ms.Length > (1 << 20)) return null;
         }
-        return Encoding.UTF8.GetString(ms.ToArray());
+        byte[] b = ms.ToArray();
+        // 有些客户端会在流首带 UTF-8 BOM（PowerShell 5.1 的管道），跳过
+        if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
+        {
+            byte[] t = new byte[b.Length - 3];
+            Array.Copy(b, 3, t, 0, t.Length);
+            b = t;
+        }
+        return Encoding.UTF8.GetString(b);
     }
 
     private static int ReadExact(NetworkStream ns, byte[] buf, int count)
