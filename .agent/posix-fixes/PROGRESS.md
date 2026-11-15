@@ -68,4 +68,18 @@
 - 2026-11-15 首轮 CI：sshd 步骤因 `Host localhost win-host` 缺 `HostName` 失败（`Could not resolve hostname win-host`），已补 `HostName localhost` 并 push（67e9a56）。
 - 2026-11-15 第二轮 CI（43717409653）：`bin/wsh` 四项（kind / --direct 中文 / 退出码 / ps5 / cmd）全部 PASS；
   `bin/sess` 在 `run` 处 `AttributeError: module 'socket' has no attribute 'AF_UNIX'` → 实现 TCP+token 兜底（见上）。
-- 2026-11-15 待办：commit & push 兜底改动，等 CI 全绿。
+- 2026-11-15 第三轮 CI（43717707650，25fa448）：TCP 兜底生效（无 AttributeError，中文/退出码都对），
+  但 **状态保持全挂**（第二次 `(Get-Location).Path` 回到 `C:\Users\runneradmin`），stderr 用例输出空，
+  `sess stop` 后残留一个 keeper。
+  定位：`read_line()` 一次 `recv(65536)` 再截到第一个换行 —— Windows TCP 回退上客户端连发
+  「token 行 + 脚本行」，两行常落在同一个 recv 里，脚本那半截被当垃圾丢掉 ⇒ keeper 等不到第二行
+  ⇒ `healthy()` 探活超时 ⇒ `hard_stop()` ⇒ 每条命令都重建会话（状态全丢、stop 与残留互踩）。
+- 2026-11-15 修复：`read_line()` 改逐字节 `recv(1)`（永不越界），CI 里给会话测试加 `-v` 并打印 keeper 日志。
+- 2026-11-15 第四轮 CI（43717977825，8d8adbd）：**全绿，失败数 0**。19 项 PASS，keeper 只 `keeper up` 一次
+  （无 respawn / bad token / handle error），`sess stop` 后无残留。
+
+## 最终状态
+- 分支 `wsh-posix-fixes`，HEAD `8d8adbd`（后续只追加本文档与 PROGRESS 更新）。
+- 三条修复 + Windows 兼容垫片 + 文档 + 新 workflow 全部完成，Windows CI 全绿。
+- 既有 `windows.yml` / `windows-exe.yml` 只存在于 `origin/windows-port`，本分支自 master 开出、
+  不含这两个文件，也未改 `win/**` ⇒ 与它们互不影响。
