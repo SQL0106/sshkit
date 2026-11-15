@@ -99,6 +99,8 @@ jobs:
           & .\win\dist\sshkit.exe wsh --direct localhost 'exit 5' | Out-Null
           if ($LASTEXITCODE -ne 5) { throw "sshkit.exe 退出码应为 5，实际 $LASTEXITCODE" }
           Write-Host 'PASS sshkit.exe 端到端（执行 + 退出码）'
+          # 上一条命令故意 exit 5，不显式清零会把整个 step 判成失败
+          exit 0
 
       - name: 离线用例（pwsh 7）
         shell: pwsh
