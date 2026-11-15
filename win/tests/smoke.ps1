@@ -78,8 +78,8 @@ function Test-PwshLoop {
     $p.StandardInput.NewLine = "`n"
     try {
         $ready = $p.StandardOutput.ReadLineAsync()
-        if (-not $ready.Wait(15000)) { return $false }
-        if ($ready.Result -ne '__READY__') { return $false }
+        if (-not $ready.Wait(15000)) { return 'READY 超时' }
+        if ($ready.Result -ne '__READY__') { return ('READY 异常: [' + $ready.Result + ']') }
         # 注意 `exit` 会直接杀掉常驻 shell（协议里没有机会写哨兵，rc=255），
         # 所以失败路径用异常验证（loop 的 catch 会把 rc 置 1）。
         foreach ($case in @(@('echo "hello"; 1+1', '0'), @('"中文"', '0'), @('throw "boom"', '1'))) {
@@ -88,21 +88,24 @@ function Test-PwshLoop {
             $p.StandardInput.WriteLine($tok + ':' + $code)
             $p.StandardInput.Flush()
             $seen = $false
+            $last = ''
             for ($n = 0; $n -lt 200; $n++) {
                 $ln = $p.StandardOutput.ReadLineAsync()
-                if (-not $ln.Wait(5000)) { return $false }
-                if ($null -eq $ln.Result) { return $false }
+                if (-not $ln.Wait(5000)) { return ("帧超时: case=[" + $case[0] + "] last=[" + $last + "]") }
+                if ($null -eq $ln.Result) { return ("EOF: case=[" + $case[0] + "] last=[" + $last + "]") }
+                $last = $ln.Result
                 if ($ln.Result -eq ("__END__" + $tok + ":" + $case[1])) { $seen = $true; break }
             }
-            if (-not $seen) { return $false }
+            if (-not $seen) { return ("哨兵不符: case=[" + $case[0] + "] last=[" + $last + "]") }
         }
-        return $true
+        return ''
     } finally {
         try { $p.Kill() } catch { }
     }
 }
 
-Check 'PowerShell 常驻 loop 握手与执行' (Test-PwshLoop)
+$loopErr = Test-PwshLoop
+Check 'PowerShell 常驻 loop 握手与执行' ($loopErr -eq '') $loopErr
 
 # ---------------------------------------------------------------- 联机
 
