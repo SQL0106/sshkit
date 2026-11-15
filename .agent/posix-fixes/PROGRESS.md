@@ -35,6 +35,12 @@
 - [x] 去掉 `/proc/<pid>`、`signal.SIGKILL` 的硬依赖（`hard_stop` / `cmd_list`）
 - [x] `main()` 把 stdout/stderr reconfigure 成 UTF-8（Windows 管道默认码页，中文诊断会 UnicodeEncodeError）
 - [x] `bin/wsh` 探测用的 `timeout` 加退化（Git Bash 可能没有 coreutils timeout）
+- [x] **Windows 没有 `socket.AF_UNIX`**（CI 实测 CPython 3.12：`hasattr(socket,"AF_UNIX") == False`，
+      run 43717409653 里 `sess run` 直接 `AttributeError`）→ 本地传输分叉：
+      `listen_sock()` 绑 `127.0.0.1:0`、`publish()` 把端口 + 一次性 token 写 `<host>.v3.port`（0600）、
+      `dial()` 读该文件连回并发 token 行、`published()` 判文件存在；keeper 侧 `handle()` 在 Windows 先校验 token。
+      `fcntl.flock` → `msvcrt.locking` 实例锁（`<host>.v3.lock`）同时补上，避免两 keeper 抢同一端口。
+- [x] 文档同步：`bin/sess` 模块 docstring、README（sess 段）、AGENTS（socket 帧格式那条）都写了 TCP+token 兜底
 
 ## 验证
 
@@ -59,4 +65,7 @@
 ## 状态记录
 - 2026-11-15 开工：worktree 在 `windows-port`，已切到 `wsh-posix-fixes`（基于 `origin/master`）。
 - 2026-11-15 三条修复 + Windows 兼容垫片 + 文档 + 新 workflow 完成；本机 POSIX 验证全通过。
-- 2026-11-15 待办：commit & push，等 CI 全绿。
+- 2026-11-15 首轮 CI：sshd 步骤因 `Host localhost win-host` 缺 `HostName` 失败（`Could not resolve hostname win-host`），已补 `HostName localhost` 并 push（67e9a56）。
+- 2026-11-15 第二轮 CI（43717409653）：`bin/wsh` 四项（kind / --direct 中文 / 退出码 / ps5 / cmd）全部 PASS；
+  `bin/sess` 在 `run` 处 `AttributeError: module 'socket' has no attribute 'AF_UNIX'` → 实现 TCP+token 兜底（见上）。
+- 2026-11-15 待办：commit & push 兜底改动，等 CI 全绿。

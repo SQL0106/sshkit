@@ -231,6 +231,8 @@ Windows 端**不需要 Git Bash**，也**不要**用 `ssh win-host 'powershell -
 
 本地客户端通过 unix socket（`~/.cache/sess/<host>.v3.sock`）用带长度前缀的帧通信：`O`=stdout、`E`=stderr、`R`=4 字节退出码。socket 与 pid 文件只在**远端会话真正就绪之后**才发布，避免客户端抢跑把命令塞进还没开始读 stdin 的 ssh。
 
+**在 Windows 上跑这份 POSIX `sess`**（Git Bash + CPython）时，CPython 没有 `socket.AF_UNIX`，所以本地传输退到 `127.0.0.1` 的临时端口：端口号与一次性 token 写进 `~/.cache/sess/<host>.v3.port`（0600），客户端连上后先发 token 行再发脚本（防本机其他进程蹭端口）。功能与 socket 版一致，只是没有文件系统权限兜底。
+
 ```sh
 sess run host '<cmd>'          # 自动起会话
 sess run --new host '<cmd>'    # 先重建会话

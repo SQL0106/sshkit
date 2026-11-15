@@ -123,7 +123,8 @@ jobs:
           eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1：期望 [$2] 实际 [$3]"; fi; }
 
           # 0) 先确认 sshd 可达，免得把连接问题算到脚本头上
-          out=$(ssh -o BatchMode=yes "$H" 'echo sshd-ok' 2>&1)
+          # （stderr 里的 known_hosts 警告不要混进比较）
+          out=$(ssh -o BatchMode=yes "$H" 'echo sshd-ok' 2>/dev/null)
           eq "sshd 可达" "sshd-ok" "$out"
 
           # 1) 默认解释器探测（有缓存也强制重探）

@@ -16,6 +16,10 @@
 `<token>:<base64 脚本>`，执行后在输出末尾写 `\\n__END__<token>:<退出码>\\n`。
 脚本一律 base64，远端本地都不做引号解析；输出的分帧全靠随机 token 哨兵。
 
+本地传输：POSIX 用 unix socket（`~/.cache/sess/<host>.v3.sock`）；Windows 的 CPython
+根本没有 `socket.AF_UNIX`（实测 3.12 不存在），所以退到 127.0.0.1 的临时端口，
+端口号 + 一次性 token 写进 `<host>.v3.port`（0600），客户端连上先发 token 行。
+
 哨兵数量按远端类型分：
   * posix  —— stdout/stderr 各一份（两条真管道，到达顺序不定，靠双哨兵对齐）；
   * windows—— 只有 stdout 一份。Windows sshd 把 stderr 压到远端进程退出才交给
@@ -105,10 +109,69 @@ while ($true) {
 
 PROTO = ".v3"   # 协议版本：升级帧格式时改这里，旧 keeper 的 socket 自然失效
 
+IS_WIN = (os.name == "nt")
+
 
 def paths(host):
     return (os.path.join(CACHE, host + PROTO + ".sock"), os.path.join(CACHE, host + PROTO + ".pid"),
             os.path.join(CACHE, host + PROTO + ".kind"), os.path.join(CACHE, host + PROTO + ".log"))
+
+
+def port_file(host):
+    return os.path.join(CACHE, host + PROTO + ".port")
+
+
+def listen_sock():
+    """监听 socket。
+
+    Windows 的 CPython **没有** AF_UNIX（`socket.AF_UNIX` 不存在，实测 3.12），
+    所以退到 127.0.0.1 的临时端口：端口和一次性 token 写进 `.port` 文件，
+    客户端连上后先发 token 行再发脚本（防本机其他进程蹭端口）。
+    """
+    if IS_WIN:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        return s
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+
+def publish(srv, host, sock_path, auth):
+    """把监听端点发布出去（调用前远端会话必须已就绪）。"""
+    if IS_WIN:
+        pf = port_file(host)
+        with open(pf, "w") as f:
+            f.write("%d\n%s\n" % (srv.getsockname()[1], auth))
+        try:
+            os.chmod(pf, 0o600)
+        except OSError:
+            pass
+    else:
+        srv.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+    srv.listen(8)
+    srv.settimeout(0.25)
+
+
+def dial(host, sock_path):
+    """连上 keeper；Windows 上顺带发 token 行。失败抛 OSError。"""
+    if IS_WIN:
+        with open(port_file(host)) as f:
+            port = int(f.readline().strip())
+            auth = f.readline().strip()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect(("127.0.0.1", port))
+        s.settimeout(None)
+        s.sendall(auth.encode() + b"\n")
+        return s
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    return s
+
+
+def published(host, sock_path):
+    """监听端点是否已发布（= keeper 就绪）。"""
+    return os.path.exists(port_file(host) if IS_WIN else sock_path)
 
 
 def ensure_cache():
@@ -187,6 +250,19 @@ def send_frame(conn, kind, data):
     conn.sendall(kind + struct.pack(">I", len(data)) + data)
 
 
+def read_line(conn, limit=4 << 20):
+    """读一行（去掉行尾换行）；对端关闭或超长返回 None。"""
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = conn.recv(65536)
+        if not chunk:
+            return None
+        data += chunk
+        if len(data) > limit:
+            return None
+    return data[:-1]
+
+
 class Keeper:
     def __init__(self, host, kind):
         self.host = host
@@ -199,6 +275,9 @@ class Keeper:
         self.dead = False
         self.last_used = time.time()
         self.kill_now = False
+        # Windows（TCP 回退）用的一次性认证 token：客户端连上后先发一行它
+        self.auth = os.urandom(16).hex()
+        self.lock_handle = None     # keeper 生命周期内的单实例锁
 
     def log(self, msg):
         try:
@@ -400,20 +479,47 @@ class Keeper:
             except OSError:
                 pass
 
+    def acquire_instance_lock(self):
+        """keeper 生命周期内的单实例锁：抢不到就说明已有 keeper，让位。
+
+        POSIX 的 bind 本身也原子，但 Windows 走 TCP 临时端口没有这个保护，
+        两个 keeper 会各自监听、后写端口文件的赢 —— 输的那个白白挂着。
+        """
+        f = open(os.path.join(CACHE, self.host + PROTO + ".lock"), "a+")
+        try:
+            if fcntl is not None:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            f.close()
+            return None
+        return f
+
     def serve(self):
         sock_path, pid_file = paths(self.host)[0], paths(self.host)[1]
+        self.lock_handle = self.acquire_instance_lock()
+        if self.lock_handle is None:
+            self.log("another keeper alive -> exit")
+            return
         # 互斥：已有活着的 keeper 就绝不抢它的 socket 文件（否则两个 keeper
         # 会轮流吃客户端，表现为「cd / 环境变量莫名其妙丢了」）
-        if live_keeper(sock_path, pid_file):
+        if live_keeper(self.host, sock_path, pid_file):
             self.log("another keeper alive -> exit")
             return
         try:
             os.unlink(sock_path)
         except OSError:
             pass
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            os.unlink(port_file(self.host))
+        except OSError:
+            pass
+        srv = listen_sock()
         self.srv = srv
-        # 关键顺序：**先 spawn 远端会话，就绪后才 bind/发布 socket**。
+        # 关键顺序：**先 spawn 远端会话，就绪后才发布监听端点**。
         # 以前先 bind 再 spawn，客户端会抢在 spawn 完成前连上（连接进 backlog），
         # 把命令塞进还没开始读 stdin 的 ssh，拿到空输出/假退出码。
         try:
@@ -424,14 +530,15 @@ class Keeper:
                 srv.close()
             except Exception:
                 pass
-            for p in (sock_path, pid_file, os.path.join(CACHE, self.host + ".sig")):
+            for p in (sock_path, port_file(self.host), pid_file,
+                      os.path.join(CACHE, self.host + ".sig")):
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
             return
         try:
-            srv.bind(sock_path)
+            publish(srv, self.host, sock_path, self.auth)
         except OSError as e:
             # 另一个 keeper 抢先绑定了同一个路径：让位（别删它的 socket/pid）
             self.log("bind failed: %r -> exit" % e)
@@ -444,11 +551,8 @@ class Keeper:
             except Exception:
                 pass
             return
-        os.chmod(sock_path, 0o600)
-        srv.listen(8)
-        # 1s 轮询：Linux 上「别的线程 close 监听 socket」不会唤醒阻塞中的 accept()，
-        # 所以靠短超时来感知 stop / 空闲，不能等 30s
-        srv.settimeout(0.25)
+        # 监听 socket 设了 0.25s 超时：Linux 上「别的线程 close 监听 socket」不会
+        # 唤醒阻塞中的 accept()，靠短超时来感知 stop / 空闲，不能等 30s
         with open(pid_file, "w") as f:
             f.write(str(os.getpid()))
         try:
@@ -474,15 +578,16 @@ class Keeper:
 
     def handle(self, conn):
         try:
-            data = b""
-            while not data.endswith(b"\n"):
-                chunk = conn.recv(65536)
-                if not chunk:
+            if IS_WIN:
+                # TCP 回退：第一行是认证 token（端口文件里那份），防本机其他进程蹭端口
+                auth = read_line(conn)
+                if auth is None or auth.decode("utf-8", "replace") != self.auth:
+                    self.log("bad token -> drop")
                     return
-                data += chunk
-                if len(data) > 4 << 20:
-                    return
-            script = data[:-1].decode("utf-8", "replace")
+            data = read_line(conn)
+            if data is None:
+                return
+            script = data.decode("utf-8", "replace")
             if script == "__STOP__":
                 self.kill_now = True
                 # 立刻打断 accept()，否则 stop 要等满 30s 超时才生效
@@ -517,11 +622,15 @@ class Keeper:
             mine = False
         if not mine:
             return          # 文件已被新 keeper 接手，别删它的
-        for p in (sock_path, pid_file):
+        for p in (sock_path, port_file(self.host), pid_file):
             try:
                 os.unlink(p)
             except OSError:
                 pass
+        try:
+            self.lock_handle.close()     # 释放单实例锁
+        except Exception:
+            pass
 
 
 def pid_alive(pid):
@@ -570,23 +679,20 @@ def kill_pid(pid):
         pass
 
 
-def live_keeper(sock_path, pid_file):
-    """pid 文件指向的进程活着、并且它的 socket 真的能连上。"""
+def live_keeper(host, sock_path, pid_file):
+    """pid 文件指向的进程活着、并且它的监听端点真的能连上。"""
     try:
         pid = int(open(pid_file).read().strip())
     except (OSError, ValueError):
         return False
     if not pid_alive(pid):
         return False
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(2)
-        s.connect(sock_path)
+        s = dial(host, sock_path)
+        s.close()
         return True
     except OSError:
         return False
-    finally:
-        s.close()
 
 
 class _Queue:
@@ -648,12 +754,10 @@ def spawn_keeper(host, verbose=False):
         return None, None
     try:
         _lock_file(lf)
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.connect(sock_path)
-            return s, None              # 别人已经起好了
+            return dial(host, sock_path), None          # 别人已经起好了
         except OSError:
-            s.close()
+            pass
         kind = detect_kind(host)
         if verbose:
             sys.stderr.write("sess: 启动会话 %s (%s)\n" % (host, kind))
@@ -697,12 +801,9 @@ def connect(host, autostart=True, verbose=False):
     proc = None
     attempt = 0
     while True:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.connect(sock_path)
-            return s
+            return dial(host, sock_path)
         except OSError:
-            s.close()
             if not autostart:
                 return None
             if attempt == 0:
@@ -812,18 +913,18 @@ def cmd_run(host, script, new=False, verbose=False):
 
 
 def wait_gone(host, timeout=5.0):
-    """等 keeper 真正退出（socket 文件消失），避免 client 连到正在关闭的旧会话。"""
+    """等 keeper 真正退出（监听端点消失），避免 client 连到正在关闭的旧会话。"""
     sock_path = paths(host)[0]
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if not os.path.exists(sock_path):
+        if not published(host, sock_path):
             return True
         time.sleep(0.05)
     return False
 
 
 def hard_stop(host):
-    """直接 SIGKILL keeper 并清掉残留 socket；用于无响应的会话（__STOP__ 会写进黑洞）。"""
+    """直接杀掉 keeper 并清掉残留端点；用于无响应的会话（__STOP__ 会写进黑洞）。"""
     sock_path, pid_file, _, _ = paths(host)
     try:
         pid = int(open(pid_file).read().strip())
@@ -835,7 +936,7 @@ def hard_stop(host):
             if not pid_alive(pid):
                 break
             time.sleep(0.02)
-    for f in (sock_path, pid_file):
+    for f in (sock_path, port_file(host), pid_file):
         try:
             os.unlink(f)
         except OSError:
