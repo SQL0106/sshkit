@@ -37,8 +37,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $exe = (Resolve-Path win\dist\sshkit.exe).Path
 
-          & $exe --help | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }
+          # 不要接管道：Select-Object -First 会提前关闭管道，$LASTEXITCODE 拿不到
+          $h = & $exe --help
           if ($LASTEXITCODE -ne 0) { throw "sshkit.exe --help 应为 0，实际 $LASTEXITCODE" }
+          $h | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }
 
           & $exe | Out-Null
           if ($LASTEXITCODE -ne 2) { throw "无参数应为 2，实际 $LASTEXITCODE" }
