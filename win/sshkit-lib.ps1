@@ -36,6 +36,8 @@ try { [Console]::SetError([Console]::Out) } catch {}
 while ($true) {
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
+    # Windows PowerShell 5.1 写管道时可能带 UTF-8 BOM，会粘在 token 前面
+    $line = $line.TrimStart([char]0xFEFF)
     if ($line.Length -eq 0) { continue }
     $i = $line.IndexOf(":")
     $tok = $line.Substring(0, $i)

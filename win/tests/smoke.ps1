@@ -74,6 +74,9 @@ function Test-PwshLoop {
     } else {
         $psi.Arguments = '-NoProfile -NonInteractive -Command ' + '"' + $lexpr.Replace('"', '\"') + '"'
     }
+    if ($null -ne $psi.PSObject.Properties['StandardInputEncoding']) {
+        $psi.StandardInputEncoding = New-Object System.Text.UTF8Encoding $false
+    }
     $p = [System.Diagnostics.Process]::Start($psi)
     $p.StandardInput.NewLine = "`n"
     try {
