@@ -28,6 +28,9 @@ $script:ShkPwshLoop = @'
 $ProgressPreference = "SilentlyContinue"
 try { $PSStyle.OutputRendering = "PlainText" } catch {}
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+# Windows sshd 只在远端进程退出时才把 stderr 交给客户端（常驻会话 = 永远收不到），
+# 所以这里把错误流并进 stdout，只发一路哨兵（详见 C# Reset() 的 pending）。
+try { [Console]::SetError([Console]::Out) } catch {}
 [Console]::Out.WriteLine("__READY__")
 [Console]::Out.Flush()
 while ($true) {
@@ -44,7 +47,7 @@ while ($true) {
     try {
         $src = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
         $src = $src + "`n" + '$global:__sessOk = $?; $global:__sessCode = $LASTEXITCODE'
-        . ([scriptblock]::Create($src))
+        . ([scriptblock]::Create($src)) 2>&1
         if (-not $global:__sessOk) {
             if ($global:__sessCode -is [int] -and $global:__sessCode -ne 0) { $code = $global:__sessCode } else { $code = 1 }
         }
@@ -54,8 +57,6 @@ while ($true) {
     }
     [Console]::Out.Write("`n__END__" + $tok + ":" + $code + "`n")
     [Console]::Out.Flush()
-    [Console]::Error.Write("`n__END__" + $tok + ":" + $code + "`n")
-    [Console]::Error.Flush()
 }
 '@
 $script:ShkPwshLoop = $script:ShkPwshLoop.Trim()

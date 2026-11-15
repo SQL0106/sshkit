@@ -356,7 +356,10 @@ public class SessKeeper
         bufs["err"] = new byte[0];
         pending = new HashSet<string>();
         pending.Add("out");
-        pending.Add("err");
+        // posix：远端 stdout/stderr 是真两路，双哨兵对齐全靠它们。
+        // windows：Windows sshd 会压着 stderr 直到远端进程退出，常驻会话里永远收不到，
+        // 所以远端已把错误流并进 stdout，这里只等 out 这一路。
+        if (kind == "posix") pending.Add("err");
         outDone = false;
         rc = 0;
     }
