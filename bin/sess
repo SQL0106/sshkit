@@ -251,16 +251,23 @@ def send_frame(conn, kind, data):
 
 
 def read_line(conn, limit=4 << 20):
-    """读一行（去掉行尾换行）；对端关闭或超长返回 None。"""
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = conn.recv(65536)
-        if not chunk:
+    """读一行（去掉行尾换行）；对端关闭或超长返回 None。
+
+    必须**不越界**：Windows 的 TCP 回退上客户端连发两行（token + 脚本），
+    两条常常落在同一个 recv 里；以前一次读整块再截到第一个换行，会把脚本
+    那半截吞掉，于是 keeper 永远等不到第二行、客户端超时后把健康会话误判
+    成无响应。逐字节读最稳（loopback 上 20KB 脚本也就几毫秒）。
+    """
+    data = bytearray()
+    while True:
+        ch = conn.recv(1)
+        if not ch:
             return None
-        data += chunk
+        if ch == b"\n":
+            return bytes(data)
+        data += ch
         if len(data) > limit:
             return None
-    return data[:-1]
 
 
 class Keeper:

@@ -153,9 +153,10 @@ jobs:
           eq "wsh sess 状态保持" 'C:\Windows' "$o"
 
           # 6) sess 直接调用：状态、退出码、失败后会话仍可用
-          "$PY" "$SESS_WIN" run "$H" 'Set-Location $env:SystemRoot' >/dev/null
+          o=$("$PY" "$SESS_WIN" run -v "$H" 'Set-Location $env:SystemRoot' 2>&1)
           eq "sess 首条命令 rc" "0" "$?"
-          o=$("$PY" "$SESS_WIN" run "$H" '(Get-Location).Path')
+          echo "  首条输出/诊断: [$o]"
+          o=$("$PY" "$SESS_WIN" run -v "$H" '(Get-Location).Path' 2>&1)
           eq "sess 状态保持" 'C:\Windows' "$o"
           "$PY" "$SESS_WIN" run "$H" 'cmd /c exit 3' >/dev/null
           eq "sess 退出码 3" "3" "$?"
@@ -163,9 +164,17 @@ jobs:
           eq "sess 失败后状态仍在" 'C:\Windows' "$o"
 
           # 7) Windows 上 stderr 并进 stdout（单哨兵的代价），且不能挂死
-          o=$($TO "$PY" "$SESS_WIN" run "$H" 'Write-Error "err-中文"; "out-ok"' 2>/dev/null)
+          o=$($TO "$PY" "$SESS_WIN" run -v "$H" 'Write-Error "err-中文"; "out-ok"' 2>&1)
+          rc=$?
           case "$o" in *err-中文*) ok "sess stderr 并到 stdout" ;; *) bad "sess stderr 并到 stdout：[$o]" ;; esac
           case "$o" in *out-ok*) ok "sess 失败不影响正常输出" ;; *) bad "sess 正常输出丢失：[$o]" ;; esac
+          echo "  (rc=$rc)"
+
+          # 诊断：keeper 日志 —— 会话是否被重建/丢状态都记在这里
+          echo "--- ~/.cache/sess ---"
+          ls -la "$HOME/.cache/sess" 2>/dev/null
+          echo "--- keeper log (tail) ---"
+          tail -n 60 "$HOME/.cache/sess/$H.v3.log" 2>/dev/null
 
           # 8) list / stop
           "$PY" "$SESS_WIN" list | grep -q "$H" && ok "sess list" || bad "sess list 没列出 $H"
