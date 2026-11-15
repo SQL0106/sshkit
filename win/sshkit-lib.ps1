@@ -398,22 +398,24 @@ function Send-ShkSessFrame($Stream, [byte]$Kind, [byte[]]$Data) {
 function Read-ShkSessFrames($Stream, [int]$FirstByteTimeoutMs = 0) {
     # 读帧直到 R（退出码）；返回退出码，或 $null（连接断了/首字节超时）
     # 只有**首字节**受超时约束：命令本身可以长时间不输出，不能一刀切。
+    # 超时用 Socket.Poll 实现（不用 ReadTimeout：它在 Windows 的 NetworkStream 上
+    # 实测不生效，会让「探活」变成永久阻塞）。
     $stdout = [Console]::OpenStandardOutput()
     $stderr = [Console]::OpenStandardError()
     $armed = $FirstByteTimeoutMs -gt 0
-    if ($armed) {
-        try { $Stream.ReadTimeout = $FirstByteTimeoutMs } catch { $armed = $false }
-    }
     $hdr = New-Object byte[] 5
     while ($true) {
+        if ($armed) {
+            $sock = $null
+            try { $sock = $Stream.Socket } catch { }
+            if ($null -ne $sock -and -not $sock.Poll($FirstByteTimeoutMs * 1000, [System.Net.Sockets.SelectMode]::SelectRead)) {
+                return $null
+            }
+            $armed = $false
+        }
         $n = 0
         try { $n = Read-ShkExact $Stream $hdr 5 } catch { return $null }
         if ($n -lt 5) { return $null }
-        if ($armed) {
-            # 已经看到数据：解除超时，长命令可以慢慢跑
-            $armed = $false
-            try { $Stream.ReadTimeout = [System.Threading.Timeout]::Infinite } catch { }
-        }
         $kind = [char]$hdr[0]
         $len = ([int]$hdr[1] -shl 24) -bor ([int]$hdr[2] -shl 16) -bor ([int]$hdr[3] -shl 8) -bor [int]$hdr[4]
         $buf = New-Object byte[] $len
@@ -455,9 +457,14 @@ function Test-ShkSessHealthy([string]$HostName) {
 }
 
 function Read-ShkSessFramesQuiet($Stream, [int]$TimeoutMs) {
-    try { $Stream.ReadTimeout = $TimeoutMs } catch { }
     $hdr = New-Object byte[] 5
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     while ($true) {
+        $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($left -le 0) { return $null }
+        $sock = $null
+        try { $sock = $Stream.Socket } catch { }
+        if ($null -ne $sock -and -not $sock.Poll($left * 1000, [System.Net.Sockets.SelectMode]::SelectRead)) { return $null }
         $n = 0
         try { $n = Read-ShkExact $Stream $hdr 5 } catch { return $null }
         if ($n -lt 5) { return $null }

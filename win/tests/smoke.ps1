@@ -150,6 +150,11 @@ if ($WinHostName -and -not $SkipSsh) {
         }
         Check 'wsh 默认(sess) 执行' (($sessOut -join "`n") -match '4') ($sessOut -join ' | ')
 
+        $wlog = Join-Path (Get-ShkCache 'sess') ($WinHostName + '.v4.log')
+        if (Test-Path -LiteralPath $wlog) {
+            [Console]::Out.WriteLine('    --- keeper 日志（本条命令前）---')
+            Get-Content -LiteralPath $wlog -Tail 8 | ForEach-Object { [Console]::Out.WriteLine("    log| $_") }
+        }
         & $exe -NoProfile -File $sess run $WinHostName 'Set-Location $env:SystemRoot' 2>&1 | ForEach-Object { [Console]::Out.WriteLine("    sess| $_") }
         $where = @()
         & $exe -NoProfile -File $sess run $WinHostName '(Get-Location).Path' 2>&1 | ForEach-Object {
