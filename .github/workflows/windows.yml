@@ -84,6 +84,22 @@ jobs:
             throw 'sshd 没起来'
           }
 
+      - name: 原生入口 sshkit.exe（编译 + 真连 sshd 的端到端）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force win\dist | Out-Null
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          & $csc /nologo /target:exe /platform:anycpu /optimize+ /out:win\dist\sshkit.exe win\launcher\sshkit.cs
+          if ($LASTEXITCODE -ne 0) { throw 'csc 失败' }
+
+          $o = & .\win\dist\sshkit.exe wsh --direct localhost '"exe-" + (1+1)'
+          if (($o -join "`n") -notmatch 'exe-2') { throw "sshkit.exe 执行异常: $o" }
+
+          & .\win\dist\sshkit.exe wsh --direct localhost 'exit 5' | Out-Null
+          if ($LASTEXITCODE -ne 5) { throw "sshkit.exe 退出码应为 5，实际 $LASTEXITCODE" }
+          Write-Host 'PASS sshkit.exe 端到端（执行 + 退出码）'
+
       - name: 离线用例（pwsh 7）
         shell: pwsh
         run: pwsh -NoProfile -File win/tests/smoke.ps1
