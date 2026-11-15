@@ -100,7 +100,18 @@ Windows 自带的 `rsh.exe`（老 Remote Shell 协议）与本工具同名：Pow
 4. **不实现 droidspaces 容器包装**（`-C` / `-c` / `-R`）：遇到直接报错，提示改用容器自己的 ssh 别名。
 5. 脚本以临时文件路径作为 `$0`（POSIX 版是 `bash`），依赖 `$0` 名字的脚本要注意。
 
-**sess 的 Windows 版**：协议升级为 v4（`127.0.0.1` 上随机端口 + 随机 token + 长度前缀请求帧），状态文件是 `<host>.v4.*`，与 POSIX 版的 v3 unix socket **互不干扰、可共存**。keeper 是独立进程，用 `Add-Type` 现场编译一段 C#（PowerShell 自身没有可靠的双管道并发 I/O）；单实例由 `FileShare.Read` 锁文件保证；keeper 的 stdout/stderr 由拉起方重定向，不会挂住调用方的管道。
+**sess 的 Windows 版**：协议升级为 v4（`127.0.0.1` 上随机端口 + 随机 token + 长度前缀请求帧），状态文件是 `<host>.v4.*`，与 POSIX 版的 v3 unix socket **互不干扰、可共存**。keeper 是独立进程，用 `Add-Type` 现场编译一段 C#（PowerShell 自身没有可靠的双管道并发 I/O）；单实例由 `FileShare.Read` 锁文件保证。
+
+**Windows 端踩过、已在代码里处理的坑**（改这块前务必读，否则会复现同样的症状）：
+
+| 现象 | 真因 | 处理 |
+|---|---|---|
+| 捕获输出为空、退出码正常 | `System.Diagnostics.Process` 不重定向时 `bInheritHandles=FALSE`，子进程拿不到 PowerShell 捕获用的管道 | 始终重定向 stdout/stderr，自己并发泵字节；交互模式走 `-Interactive` 保留真 TTY |
+| `wsh host cmd \| tail` 永不结束、脚本打印了 `exiting` 却不退出 | 同上，keeper 继承调用方 stdout 写端；且 PowerShell 的 `exit` 会被残留资源拖住 | Windows 用 `Start-Process`（ShellExecute，不继承句柄）拉 keeper；收尾用 `[Environment]::Exit` |
+| 中文变成 `?` | 远端 pwsh 7 在重定向输出时按系统码页（437/936）编码，不自动用 UTF-8 | 远端 PROLOGUE 无条件设 `[Console]::OutputEncoding=UTF8` |
+| PS 5.1 报「Missing closing '}'」 | 5.1 没有 BOM 时按 ANSI 码页读 `.ps1` | 所有 `.ps1` 存成 **UTF-8 with BOM** |
+| 会话第一条正常、之后卡死 | Windows sshd 把远端 stderr 压到进程退出才交出来，常驻会话永远收不到双哨兵 | Windows 会话远端把 stderr 并入 stdout，只发单哨兵；退出码以 stdout 哨兵为准 |
+| 探活永久阻塞 | 超时用的是 `NetworkStream.ReadTimeout`，在 Windows 上不生效 | 改用 `Socket.Poll(...)` 做硬超时 |
 
 **性能**（Fedora + pwsh 7.6，真连一台 Linux 主机实测，非 Windows 硬件）：
 
@@ -115,8 +126,8 @@ Windows 自带的 `rsh.exe`（老 Remote Shell 协议）与本工具同名：Pow
 **验证状态**
 
 - 已实测（Fedora + pwsh 7.6 → 真 Linux 主机）：`rsh` 执行/退出码/stdin 透传/`-f`/`-n`/`-s`、`sess` 状态保持与停止、`wsh` 跨解释器（`pwsh.exe -EncodedCommand`）路径。
-- 真 Windows 由 CI 验证（`.github/workflows/windows.yml`：`windows-latest` 上开本地 sshd、DefaultShell=pwsh，真跑 `wsh`/`sess`/`--shell cmd`/`--shell ps5`/中文/退出码/安装脚本，并用 Windows PowerShell 5.1 跑同一套离线用例）。
-- 未覆盖：Windows 上带口令私钥的 ssh-agent 交互；远端默认 shell 为 cmd 时没有 sess（协议不支持，自动回落一次性 ssh）。
+- **真 Windows 已由 CI 跑通**（`.github/workflows/windows.yml`，`windows-latest` 上开本地 sshd、DefaultShell=pwsh）：离线用例、一次性 ssh（执行/中文/退出码/stdin 透传）、`sess`（状态保持）、`--shell cmd`、`--shell ps5`、`kind` 探测、`-f` 脚本、`install.ps1`，以及用 Windows PowerShell 5.1 跑同一套离线用例。
+- 未覆盖：Windows 上带口令私钥的 ssh-agent 交互；远端默认 shell 为 cmd 时没有 sess（协议不支持，自动回落一次性 ssh）；`sess` 在 Windows 会话里 **stderr 会并到 stdout**（见上表）。
 
 ## rsh
 

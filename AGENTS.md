@@ -38,7 +38,11 @@
 - Windows OpenSSH 下**嵌套 `pwsh`/`cmd` 的退出码一律被吞成 1**（只有本进程 `exit` 才透传）→ 别用 `ssh win 'powershell -Command ...'`；`-Command -` 读 stdin 也是 rc=1。`wsh` 已在脚本尾部显式 `exit` 并按需回传 `$LASTEXITCODE`，且设 `$PSStyle.OutputRendering='PlainText'`、强制 UTF-8。
 - 命令长度上限约 20KB（base64 后），更大先 scp 上去再执行。
 - **Windows 版铁律：ssh 的 argv 里绝不能出现引号**。PS 5.1 的原生参数传递（Legacy）会破坏含双引号的参数，所以用户命令一律本地 base64：`rsh` → 远端 `mktemp` 脚本（执行后删除），`wsh` → `& ([scriptblock]::Create(...))` 或 `xxx.exe -NoProfile -EncodedCommand`。改这块前先读 `win/sshkit-lib.ps1` 顶部三条约束。
-- **Windows sess 是 v4 协议**：`127.0.0.1` 随机端口 + 随机 token + `<token>\n<字节数>\n<script>` 请求帧，状态文件 `<host>.v4.*`（与 POSIX 的 v3 unix socket 共存）。keeper 由 `Add-Type` 编译 C# 实现，**拉起时必须 `RedirectStandardOutput/Error`**（否则 keeper 持有调用方管道，`rsh ... | tail` 永不结束），单实例靠 `FileShare.Read` 锁文件；`sess stop` 必须走长度前缀帧（早期写错格式会导致「停不掉 + 删了端口文件 + 锁互斥卡死」）。
+- **Windows sess 是 v4 协议**：`127.0.0.1` 随机端口 + 随机 token + `<token>\n<字节数>\n<script>` 请求帧，状态文件 `<host>.v4.*`（与 POSIX 的 v3 unix socket 共存）。keeper 由 `Add-Type` 编译 C# 实现，单实例靠 `FileShare.Read` 锁文件；`sess stop` 必须走长度前缀帧（早期写错格式会导致「停不掉 + 删了端口文件 + 锁互斥卡死」）。端口文件**必须等远端 READY 之后才发布**，否则客户端会抢在 Spawn 完成前连上。
+- **Windows 句柄继承是这批坑的总根子**：`System.Diagnostics.Process` 在有重定向时 `bInheritHandles=TRUE`（keeper 会继承调用方 stdout 写端 → `wsh host cmd | tail` 永不结束），不重定向时又是 `FALSE`（子进程拿不到 PowerShell 捕获用的管道 → 输出整段丢失）。所以：**Windows 拉 keeper 用 `Start-Process`（ShellExecute，不继承）**，POSIX 用 `Process + RedirectStandardOutput/Error`（.NET 给新管道，天然 CLOEXEC）；普通命令一律重定向并自己泵字节。收尾用 `[Environment]::Exit`（PowerShell 的 `exit` 在 Windows 上会被残留资源拖住）。
+- **Windows 会话只有一路流**：Windows sshd 会把远端 stderr 压到进程退出才交给客户端，常驻会话里永远收不到 stderr 哨兵。所以 Windows 版远端 loop 把错误流并进 stdout（`[Console]::SetError([Console]::Out)` + `2>&1`），只发单哨兵；退出码以 stdout 哨兵为准。**代价：Windows 上 `sess` 的 stderr 会出现在 stdout。**
+- **`.ps1` 必须存成 UTF-8 with BOM**：Windows PowerShell 5.1 无 BOM 时按 ANSI 码页读，中文注释会把解析搞挂。另外 5.1 写管道会在流首带 BOM，远端 loop 要剥掉 token 前的非十六进制字符。
+- 超时别用 `NetworkStream.ReadTimeout`（Windows 上实测不生效，探活会永久阻塞），用 `Socket.Poll` 做硬超时。
 - Windows 版**不做**远端 ssh-agent 自愈前导，**不支持** droidspaces 容器包装（`-C/-c/-R`）。Windows OpenSSH 客户端也不支持 `ControlMaster`，复用连接只能靠 sess。
 
 ## 性能参考（本机实测）
