@@ -92,6 +92,15 @@ rsh --sess linux-host 'cd /var/log; pwd'
 
 Windows 自带的 `rsh.exe`（老 Remote Shell 协议）与本工具同名：PowerShell 里函数优先，cmd.exe 里则取决于 PATH 顺序。
 
+仓库里还带了一个**预编译的原生入口** `win/dist/sshkit.exe`（9 KB，.NET Framework 4.0，Windows 自带运行时）：
+
+```bat
+sshkit.exe rsh linux-host "uname -a"
+sshkit.exe sess list
+```
+
+它只是把子命令转发给同目录的 `rsh.ps1` / `wsh.ps1` / `sess.ps1`，好处是**不依赖 PowerShell profile、不受 ExecutionPolicy 影响**，从 cmd / 计划任务 / 任何程序里都能直接调；代价是**内部仍然启动 PowerShell**，每条命令那 ~0.4s 启动开销省不掉。源码在 `win/launcher/sshkit.cs`，用 `.github/workflows/windows-exe.yml`（`csc.exe`，不需要 .NET SDK）重建。把 exe 复制/硬链接成 `rsh.exe`、`wsh.exe`、`sess.exe` 时，文件名即子命令。
+
 **与 POSIX 版的关键差异（都是实测后有意为之）**
 
 1. **命令不进 ssh 的 argv**：命令在本地 base64，远端用 `mktemp` 落一个脚本、执行、立即删除。PowerShell 5.1 的原生参数传递（Legacy 模式）对含双引号的参数有破坏性转义，任何「把命令拼进 ssh 参数」的写法在 5.1 上都不可靠。四种候选传输方式实测下来，唯一「零引号 + 保住 stdin」的形态就是它。

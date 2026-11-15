@@ -43,6 +43,12 @@ if ($PSCmdlet.ShouldProcess($winDir, '复制脚本')) {
     New-Item -ItemType Directory -Force -Path $winDir | Out-Null
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
     foreach ($f in $files) { Copy-Item -LiteralPath (Join-Path $src $f) -Destination (Join-Path $winDir $f) -Force }
+    # 预编译的原生入口（库里带的 dist\sshkit.exe；没有就用 .cmd 入口）
+    $exeSrc = Join-Path $src 'dist\sshkit.exe'
+    if (Test-Path -LiteralPath $exeSrc) {
+        Copy-Item -LiteralPath $exeSrc -Destination (Join-Path $binDir 'sshkit.exe') -Force
+        [Console]::Out.WriteLine("已装原生入口: $(Join-Path $binDir 'sshkit.exe')")
+    }
 }
 
 # ---- cmd.exe 入口 --------------------------------------------------------
