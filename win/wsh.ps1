@@ -202,7 +202,7 @@ if ($mode -eq 'file') {
     $body = [Text.Encoding]::UTF8.GetString($bytes)
 } elseif ($i -ge $a.Count) {
     # 交互
-    exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName) -Interactive)
+    Exit-ShkProcess (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName) -Interactive)
 } else {
     $body = ($a[$i..($a.Count - 1)] -join ' ')
 }
@@ -245,7 +245,7 @@ if ($defKind -eq 'cmd' -and $useSess) {
 if ($useSess -and $psCode -ne '') {
     $rc = Invoke-ShkSessRun -HostName $hostName -Script $psCode
     Trace-ShkSess "wsh: exiting rc=$rc"
-    exit $rc
+    Exit-ShkProcess $rc
 }
 
 if ($defKind -eq 'cmd') {
@@ -258,8 +258,8 @@ if ($defKind -eq 'cmd') {
         [Console]::Error.WriteLine('     改用：wsh --shell pwsh|ps5 ' + $hostName + " '<命令>'（或把命令写进 .cmd 再执行）")
         exit 2
     }
-    exit (Start-ShkProcess -File 'ssh' -ArgList @('-T', $hostName, $raw))
+    Exit-ShkProcess (Start-ShkProcess -File 'ssh' -ArgList @('-T', $hostName, $raw))
 }
 
 $script = (($PROLOGUE.Trim()) + "`n" + $psCode + "`n" + ($EPILOGUE.Trim()))
-exit (Start-ShkProcess -File 'ssh' -ArgList @('-T', $hostName, (New-ScriptBlockExpr $script)))
+Exit-ShkProcess (Start-ShkProcess -File 'ssh' -ArgList @('-T', $hostName, (New-ScriptBlockExpr $script)))

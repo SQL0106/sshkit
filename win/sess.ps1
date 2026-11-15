@@ -713,7 +713,7 @@ switch ($op) {
         }
         $h = [string]$rest[0]
         $script = (@($rest[1..($rest.Count - 1)]) -join ' ')
-        exit (Invoke-ShkSessRun -HostName $h -Script $script -New:$new -Verbose:$verbose)
+        Exit-ShkProcess (Invoke-ShkSessRun -HostName $h -Script $script -New:$new -Verbose:$verbose)
     }
     'list' {
         $ss = @(Get-ShkSessSessions)

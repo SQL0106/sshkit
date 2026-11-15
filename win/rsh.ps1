@@ -141,11 +141,11 @@ if ($mode -eq 'file') {
     if ($useSess) {
         $text = [Text.Encoding]::UTF8.GetString($bytes)
         if (-not $native) { $text = ($pathPrelude.Trim()) + "`n" + $text }
-        exit (Invoke-ShkSessRun -HostName $hostName -Script $text)
+        Exit-ShkProcess (Invoke-ShkSessRun -HostName $hostName -Script $text)
     }
     if ($native) { $interp = 'sh -s' }
     else { $interp = 'if command -v bash >/dev/null 2>&1; then exec bash --noprofile --norc -s; else exec sh -s; fi' }
-    exit (Start-ShkProcess -File 'ssh' -ArgList @('-T', $hostName, $interp) -RedirectIn -StdinBytes $bytes)
+    Exit-ShkProcess (Start-ShkProcess -File 'ssh' -ArgList @('-T', $hostName, $interp) -RedirectIn -StdinBytes $bytes)
 }
 
 if ($cmdWords.Count -eq 0) {
@@ -153,9 +153,9 @@ if ($cmdWords.Count -eq 0) {
         [Console]::Error.WriteLine("rsh: --sess 是非交互会话，交互请直接 rsh $hostName")
         exit 2
     }
-    if ($native) { exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName) -Interactive) }
-    exit (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName,
+    if ($native) { Exit-ShkProcess (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName) -Interactive) }
+    Exit-ShkProcess (Start-ShkProcess -File 'ssh' -ArgList @('-t', $hostName,
         'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi') -Interactive)
 }
 
-exit (Invoke-RshExec ($cmdWords -join ' '))
+Exit-ShkProcess (Invoke-RshExec ($cmdWords -join ' '))

@@ -535,6 +535,15 @@ function Send-ShkSessScript($Stream, [string]$Token, [string]$Text) {
     $Stream.Flush()
 }
 
+function Exit-ShkProcess([int]$Code) {
+    # PowerShell 的 exit 在 Windows 上偶尔会被残留的进程/流资源拖住（实测：脚本已打印
+    # "exiting rc=0" 但进程不退出，调用方管道永远等不到 EOF）。这里显式冲刷后硬退出，
+    # 语义也更接近 POSIX 版的 exec。
+    try { [Console]::Out.Flush() } catch { }
+    try { [Console]::Error.Flush() } catch { }
+    [Environment]::Exit($Code)
+}
+
 function Trace-ShkSess([string]$Msg) {
     # SSHKIT_SESS_TRACE=1 时打印带毫秒时间戳的阶段标记（排障用，平时零开销）
     if ($env:SSHKIT_SESS_TRACE -eq '1') {
