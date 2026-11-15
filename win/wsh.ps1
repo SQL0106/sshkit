@@ -243,7 +243,9 @@ if ($defKind -eq 'cmd' -and $useSess) {
 }
 
 if ($useSess -and $psCode -ne '') {
-    exit (Invoke-ShkSessRun -HostName $hostName -Script $psCode)
+    $rc = Invoke-ShkSessRun -HostName $hostName -Script $psCode
+    Trace-ShkSess "wsh: exiting rc=$rc"
+    exit $rc
 }
 
 if ($defKind -eq 'cmd') {

@@ -576,13 +576,14 @@ function Invoke-ShkSessRun {
         Trace-ShkSess "sent, reading frames (first-byte timeout ${fb}s)"
         $rc = Read-ShkSessFrames $s ($fb * 1000)
         Trace-ShkSess "frames done rc=$rc"
-        if ($null -eq $rc) {
+        if ($null -eq $rc) {  # 无响应
             [Console]::Error.WriteLine("sess: $HostName 会话无响应（首字节 ${fb}s 超时或连接断开），可用 --new 重建；日志：$((Get-ShkSessPaths $HostName).Log)")
             return 1
         }
         return $rc
     } finally {
         try { $conn.Client.Close() } catch { }
+        Trace-ShkSess 'connection closed'
     }
 }
 
