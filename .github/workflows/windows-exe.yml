@@ -1,0 +1,61 @@
+name: windows-exe
+
+# 编译 win/launcher/sshkit.cs → sshkit.exe（.NET Framework 4.0，Windows 自带运行时，
+# 不需要 .NET SDK）。产物作为 artifact 上传；需要入库时下载后提交到 win/dist/。
+on:
+  push:
+    paths:
+      - 'win/launcher/**'
+      - '.github/workflows/windows-exe.yml'
+  pull_request:
+    paths:
+      - 'win/launcher/**'
+      - '.github/workflows/windows-exe.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译 sshkit.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force win\dist | Out-Null
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { throw "找不到 csc.exe: $csc" }
+          & $csc /nologo /target:exe /platform:anycpu /optimize+ /out:win\dist\sshkit.exe win\launcher\sshkit.cs
+          if ($LASTEXITCODE -ne 0) { throw "csc 失败 rc=$LASTEXITCODE" }
+          Get-Item win\dist\sshkit.exe | Format-List Name, Length
+
+      - name: 冒烟（可执行 + 子命令分发 + 退出码）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path win\dist\sshkit.exe).Path
+
+          & $exe --help | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }
+          if ($LASTEXITCODE -ne 0) { throw "sshkit.exe --help 应为 0，实际 $LASTEXITCODE" }
+
+          & $exe | Out-Null
+          if ($LASTEXITCODE -ne 2) { throw "无参数应为 2，实际 $LASTEXITCODE" }
+
+          $o = & $exe sess list
+          if (($o -join "`n") -notmatch '会话') { throw "sess list 输出异常: $o" }
+
+          $o = & $exe rsh --help
+          if (($o -join "`n") -notmatch 'rsh') { throw "rsh --help 输出异常" }
+
+          & $exe wsh --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "wsh --help 应为 0，实际 $LASTEXITCODE" }
+
+          Write-Host 'PASS 可执行 + 子命令分发 + 退出码'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sshkit-exe
+          path: win/dist/sshkit.exe
+          if-no-files-found: error
