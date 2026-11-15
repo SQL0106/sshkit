@@ -211,10 +211,12 @@ wsh --cmd win-host 'echo %COMPUTERNAME%'     # 等价写法
 - **多行 cmd**：`cmd /c` 只执行第一条命令行，`wsh` 会自动把多行折成 ` & ` 连接（因此 `goto`/label 不可用）。
 - **退出码**：尾部显式 `exit`，先看 `$?` 再看 `$LASTEXITCODE`，非零就原样回传；cmd 走 `cmd /c` 的退出码。
 - **编码**：输出统一强制 UTF-8，中文永远可读（中文 Windows `chcp 936` 下实测：`d6d0cec4` GBK 乱码 → `e4b8ad` UTF-8）。
-  - pwsh 7：管道输出本来就是 UTF-8 no-BOM，只设 `$PSStyle.OutputRendering="PlainText"` 去 ANSI（再设一次 `Console::OutputEncoding` 要多花 ~280ms）。
-  - PS 5.1：**所有路径**都会先注入 `[Console]::OutputEncoding` / `$OutputEncoding` = UTF-8（含默认 shell 就是 5.1 的快路径），所以脚本里不需要再自己写这两行。
+  - **所有 PowerShell 路径（pwsh 7 / 5.1 / 跨解释器子进程）都无条件注入** `[Console]::OutputEncoding` / `$OutputEncoding` = UTF-8（no BOM）。
+  - **pwsh 7 也必须设**：Windows 上它的 stdio 被重定向到管道时同样按系统码页（437/936）编码，中文会变成 ASCII `?`（Windows 实测 ssh 通道收到 `3f 3f`）。早期版本只给 5.1 设，等于没修。代价是 pwsh 7 每条多约 280ms（sess 会话里只付一次）。
+  - `$PSStyle.OutputRendering="PlainText"` 仍在 ≥7 时设（只管 ANSI 转义，不影响编码）。
+  - PS 5.1 的快路径（默认 shell 就是 5.1、不注入完整 PROLOGUE）也单独注入同样两行编码设置，所以脚本里不需要自己写。
   - cmd：命令含非 ASCII 时前置 `chcp 65001>nul`；个别完全无视控制台代码页的老程序仍会吐 GBK，用 `| iconv -f GBK -t UTF-8` 兜底。
-  - 纯 ASCII 命令不触发任何额外动作，不付开销。
+  - 纯 ASCII 命令不触发 cmd 的 `chcp`；PowerShell 路径的编码设置无条件执行（见上）。
 - **本地 ssh-agent**：与 `rsh` 同一套——先内联 `ssh-add -l`（约 6ms），健康就不再 fork `ssh-unlock`（省约 25ms）；`rc=2`（socket 陈旧 / agent 已死）就地 `rm -f` + 重启 + 解锁，仍失败只在 **stderr 打一行**诊断。`SSH_AUTH_SOCK` 指向别的（转发）agent 时绝不删/重启。控制：`WSH_AGENT=auto|off`（默认 auto）、`WSH_NO_AGENT_FIX=1`。
 - **上限**：base64 后约 20KB（Windows 命令行长度限制）。更大的脚本先 scp 上去。
 
@@ -222,7 +224,12 @@ Windows 端**不需要 Git Bash**，也**不要**用 `ssh win-host 'powershell -
 
 ## sess
 
-每个 host 一个 keeper 守护进程，持一条 `ssh -T`；远端是个读 stdin 的循环，每行 `<token>:<base64 脚本>`，执行完在 **stdout 与 stderr 各写一份** `__END__<token>:<rc>` 哨兵。本地客户端通过 unix socket（`~/.cache/sess/<host>.v3.sock`）用带长度前缀的帧通信：`O`=stdout、`E`=stderr、`R`=4 字节退出码。
+每个 host 一个 keeper 守护进程，持一条 `ssh -T`；远端是个读 stdin 的循环，每行 `<token>:<base64 脚本>`，执行完写 `__END__<token>:<rc>` 哨兵。哨兵数量按远端类型分：
+
+- **posix**：stdout 与 stderr **各写一份**（两条真管道，到达顺序不定，靠双哨兵对齐）。
+- **windows**：**只有 stdout 一份**。Windows sshd 会压着 stderr 直到远端进程退出才交给客户端，而常驻会话永不退出 ⇒ stderr 哨兵永远到不了。远端的 PowerShell loop 把错误流并进 stdout（`[Console]::SetError([Console]::Out)` + `2>&1`），所以 **Windows 目标上 sess 的 stderr 会出现在 stdout 里，分不开**（退出码仍准确）。
+
+本地客户端通过 unix socket（`~/.cache/sess/<host>.v3.sock`）用带长度前缀的帧通信：`O`=stdout、`E`=stderr、`R`=4 字节退出码。socket 与 pid 文件只在**远端会话真正就绪之后**才发布，避免客户端抢跑把命令塞进还没开始读 stdin 的 ssh。
 
 ```sh
 sess run host '<cmd>'          # 自动起会话
@@ -235,9 +242,13 @@ sess kind [--reset] <host>     # 远端是 posix 还是 windows
 
 状态保留的语义：命令在远端是 `eval` 在**顶层**执行的，所以 `cd`、`export`、函数定义都会留在会话里；`exit` 会杀掉远端 shell（返回 255），下次调用自动重建 —— 这是预期行为。
 
-### 为什么是双哨兵
+### 为什么是双哨兵（以及 Windows 为什么是单哨兵）
 
-`stdout` 和 `stderr` 是两条独立管道，到达顺序没有保证。如果只在 stdout 上写一个结束标记，晚到的 stderr 就会被丢掉（早期版本确实偶发丢 stderr）。现在两条流各写一份，keeper 等两路都见到哨兵才收工，rc 以 stdout 为准；同时留了 0.3s 宽限，防止用户代码 `exec 2>&1` 导致 stderr 哨兵永远不出现时卡死。
+POSIX 目标上 `stdout` 和 `stderr` 是两条独立管道，到达顺序没有保证。如果只在 stdout 上写一个结束标记，晚到的 stderr 就会被丢掉（早期版本确实偶发丢 stderr）。所以两条流各写一份，keeper 等两路都见到哨兵才收工，rc 以 stdout 为准；同时留了 0.3s 宽限。
+
+宽限用尽（只收到 stdout 哨兵）时，退出码取 stdout 哨兵里的真实 rc，但**该会话标记为已死并 kill**（stderr 里可能还有上一条的残留），下一条命令重建 —— 这样既不会卡死，也不会串味。
+
+Windows 目标走另一条路：sshd 把 stderr 压到远端进程退出才交给客户端，常驻会话永远等不到 stderr 哨兵，所以远端把错误流并进 stdout、只发一份哨兵，keeper 也只等 `out` 一路（`Keeper.reset()` 里按 kind 决定 `pending`）。
 
 ### 为什么不用 mosh / ControlPersist
 

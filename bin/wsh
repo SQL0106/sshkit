@@ -41,14 +41,13 @@ set -u
 
 PROLOGUE='$ProgressPreference="SilentlyContinue"
 $ErrorActionPreference="Continue"
-if ($PSVersionTable.PSVersion.Major -lt 7) {
-    # Windows PowerShell 5.1 默认按 ANSI/CLIXML 输出，必须显式转 UTF-8
-    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
-    try { $OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
-} else {
-    # pwsh 7 管道输出本来就是 UTF-8 no-BOM；再赋一次 Console.OutputEncoding 会白白多花约 280ms
-    try { $PSStyle.OutputRendering = "PlainText" } catch {}
-}'
+# 无条件设 UTF-8：Windows 的默认输出码页是 437/936，中文在 437 下会被编码成
+# ASCII '?'（Windows 实测：ssh 通道上收到 3f 3f）。pwsh 7 **不**会自动用 UTF-8
+# —— stdio 被重定向到管道时，它按系统码页编码（以前这里只给 5.1 设，等于没修）。
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+try { $OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+# PSStyle 只有 7+ 有；只管 ANSI 转义，不影响编码
+try { if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = "PlainText" } } catch {}'
 
 EPILOGUE='$__ok = $?
 $__code = $LASTEXITCODE
@@ -104,6 +103,16 @@ ps_wrap_cmd() {
 
 # ---- 默认解释器探测 -------------------------------------------------------
 
+# 探测用的一次性 ssh 加硬超时；没有 coreutils timeout 的环境（部分 Git Bash）
+# 就退化为只靠 ssh 自己的 ConnectTimeout，不影响功能。
+_to() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30 "$@"
+    else
+        "$@"
+    fi
+}
+
 detect_shell() {
     # 成功时输出 pwsh|ps5|cmd 并写缓存；失败 return 1
     _sf="$HOME/.cache/wsh/$host.shell"
@@ -113,13 +122,13 @@ detect_shell() {
             pwsh|ps5|cmd) printf '%s\n' "$_k"; return 0 ;;
         esac
     fi
-    _ver=$(timeout 30 ssh -T -o ConnectTimeout=10 "$host" '$PSVersionTable.PSVersion.Major' 2>/dev/null) || _ver=""
+    _ver=$(_to ssh -T -o ConnectTimeout=10 "$host" '$PSVersionTable.PSVersion.Major' 2>/dev/null) || _ver=""
     case "$_ver" in
         7*) _k=pwsh ;;
         5*|4*|3*|2*) _k=ps5 ;;
         *)
             # 不是 PowerShell：再确认是不是 cmd（ssh 到 POSIX 机也会落到这里，按透传处理）
-            _out=$(timeout 30 ssh -T -o ConnectTimeout=10 "$host" 'echo WSH_CMD_OK' 2>/dev/null) || _out=""
+            _out=$(_to ssh -T -o ConnectTimeout=10 "$host" 'echo WSH_CMD_OK' 2>/dev/null) || _out=""
             case "$_out" in
                 *WSH_CMD_OK*) _k=cmd ;;
                 *) return 1 ;;

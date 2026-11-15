@@ -1,0 +1,176 @@
+name: windows-posix
+
+# 在真正的 Windows 上验证 **POSIX 版** `bin/wsh`（POSIX sh）与 `bin/sess`（Python 3）：
+# 用 Git Bash 的 sh/python 驱动本机 sshd（DefaultShell = pwsh 7）。
+#
+# 与 windows.yml（PowerShell 原生版 `win/**`）互补：两份测的是两套独立实现，
+# 互不依赖（本文件不起也不影响 windows.yml）。
+on:
+  push:
+    paths:
+      - 'bin/**'
+      - '.github/workflows/windows-posix.yml'
+  pull_request:
+    paths:
+      - 'bin/**'
+      - '.github/workflows/windows-posix.yml'
+  workflow_dispatch:
+
+jobs:
+  posix-on-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python（Git Bash 里调用的就是它）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 启用本地 sshd（密钥登录，默认 shell = pwsh 7）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+          }
+
+          # 一次性密钥（-N '' 是真空口令；写成 '""' 会被当成两个字面引号）
+          $key = Join-Path $env:RUNNER_TEMP 'ci_key'
+          if (Test-Path $key) { Remove-Item $key -Force }
+          & ssh-keygen -t ed25519 -f $key -N '' -q
+          if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen 失败' }
+          # 自检：能无口令导出公钥，说明私钥没有 passphrase
+          & ssh-keygen -y -f $key | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '私钥带口令（-N 没生效）' }
+
+          # 管理员账号登录走 administrators_authorized_keys（ACL 必须收紧）
+          $sshProg = Join-Path $env:ProgramData 'ssh'
+          New-Item -ItemType Directory -Force -Path $sshProg | Out-Null
+          $ak = Join-Path $sshProg 'administrators_authorized_keys'
+          Copy-Item "$key.pub" $ak -Force
+          icacls $ak /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
+
+          # 默认 shell = pwsh 7：bin/wsh 的 auto 探测和 bin/sess 的 windows loop 都依赖它
+          $pwsh = (Get-Command pwsh).Source
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
+            -Value $pwsh -PropertyType String -Force | Out-Null
+
+          Start-Service sshd
+
+          # localhost 与 win-host 两个别名（README 里用脱敏名 win-host）
+          $sshDir = Join-Path $env:USERPROFILE '.ssh'
+          New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+          @"
+          Host localhost win-host
+              User $env:USERNAME
+              IdentityFile $key
+              StrictHostKeyChecking no
+              UserKnownHostsFile NUL
+              IdentitiesOnly yes
+          "@ | Set-Content -Path (Join-Path $sshDir 'config') -Encoding ascii
+
+          & ssh -o BatchMode=yes win-host 'echo sshd-ok'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '--- 诊断 ---'
+            Get-Service sshd | Format-List Name, Status, StartType | Out-String | Write-Host
+            & ssh -vv -o BatchMode=yes win-host 'echo probe' 2>&1 |
+              Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+            throw 'sshd 没起来'
+          }
+
+      - name: POSIX wsh / sess（Git Bash）
+        shell: bash
+        run: |
+          # GitHub 的 shell: bash 默认带 -e（任何非零就中止）；这里要自己检查退出码
+          set +e
+          export PYTHONIOENCODING=utf-8
+
+          # Windows 上 checkout 可能带 CRLF：POSIX 脚本会被 \r 污染（变量值、shebang 全错）
+          sed -i 's/\r$//' bin/wsh bin/sess
+          H=win-host
+          SESS_WIN=$(cygpath -w "$PWD/bin/sess")
+          [ -n "$SESS_WIN" ] || { echo "FAIL cygpath 拿不到 bin/sess 的 Windows 路径"; exit 1; }
+
+          # Git Bash 里 Python 可能叫 python / python3 / py，自己探测
+          PY=""
+          for c in python python3 py; do
+            if command -v "$c" >/dev/null 2>&1; then PY=$c; break; fi
+          done
+          [ -n "$PY" ] || { echo "FAIL 找不到 python"; exit 1; }
+          echo "python: $("$PY" -c 'import sys;print(sys.version.split()[0], sys.executable)')"
+          echo "ssh:    $("$PY" -c 'import shutil;print(shutil.which("ssh"))')"
+          "$PY" -c 'import socket,sys; print("AF_UNIX:", hasattr(socket,"AF_UNIX"))'
+
+          # bin/wsh 会去 $HOME/.local/bin/sess 找 sess；Git Bash 里的 shebang
+          # （#!/usr/bin/env python3）不保证可用，放一个用 setup-python 解释器的包装器。
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/sess" <<EOF
+          #!/bin/sh
+          exec "$PY" "$SESS_WIN" "\$@"
+          EOF
+          chmod +x "$HOME/.local/bin/sess"
+
+          # 有 coreutils timeout 就加硬超时；没有就用裸命令（Git Bash 通常有）
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 60"; else TO=""; fi
+
+          fails=0
+          ok()  { echo "PASS  $*"; }
+          bad() { echo "FAIL  $*"; fails=$((fails+1)); }
+          eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1：期望 [$2] 实际 [$3]"; fi; }
+
+          # 0) 先确认 sshd 可达，免得把连接问题算到脚本头上
+          out=$(ssh -o BatchMode=yes "$H" 'echo sshd-ok' 2>&1)
+          eq "sshd 可达" "sshd-ok" "$out"
+
+          # 1) 默认解释器探测（有缓存也强制重探）
+          k=$(bash bin/wsh kind --reset "$H" 2>/dev/null)
+          eq "wsh kind = pwsh" "pwsh" "$k"
+
+          # 2) --direct：中文编码 + 表达式（修复 1：pwsh 7 也必须强制 UTF-8）
+          o=$(bash bin/wsh --direct "$H" '"中文-" + (1+1)')
+          eq "wsh --direct 中文" "中文-2" "$o"
+
+          # 3) --direct：退出码透传
+          bash bin/wsh --direct "$H" 'exit 7'
+          eq "wsh --direct 退出码" "7" "$?"
+
+          # 4) 跨解释器：PS 5.1（UTF-16LE + iconv 路径）与 cmd
+          o=$(bash bin/wsh --direct --shell ps5 "$H" '"ps5-中文-" + $PSVersionTable.PSVersion.Major')
+          eq "wsh --shell ps5 中文" "ps5-中文-5" "$o"
+          o=$(bash bin/wsh --direct --shell cmd "$H" 'echo cmd-ok')
+          eq "wsh --shell cmd" "cmd-ok" "$o"
+
+          # 5) 默认路径 = sess：中文 + 状态保持（修复 2：Windows 单哨兵 + 编码）
+          o=$(bash bin/wsh "$H" '"sess-中文-" + (2+3)')
+          eq "wsh 默认(sess) 中文" "sess-中文-5" "$o"
+          bash bin/wsh "$H" 'Set-Location $env:SystemRoot' >/dev/null
+          o=$(bash bin/wsh "$H" '(Get-Location).Path')
+          eq "wsh sess 状态保持" 'C:\Windows' "$o"
+
+          # 6) sess 直接调用：状态、退出码、失败后会话仍可用
+          "$PY" "$SESS_WIN" run "$H" 'Set-Location $env:SystemRoot' >/dev/null
+          eq "sess 首条命令 rc" "0" "$?"
+          o=$("$PY" "$SESS_WIN" run "$H" '(Get-Location).Path')
+          eq "sess 状态保持" 'C:\Windows' "$o"
+          "$PY" "$SESS_WIN" run "$H" 'cmd /c exit 3' >/dev/null
+          eq "sess 退出码 3" "3" "$?"
+          o=$("$PY" "$SESS_WIN" run "$H" '(Get-Location).Path')
+          eq "sess 失败后状态仍在" 'C:\Windows' "$o"
+
+          # 7) Windows 上 stderr 并进 stdout（单哨兵的代价），且不能挂死
+          o=$($TO "$PY" "$SESS_WIN" run "$H" 'Write-Error "err-中文"; "out-ok"' 2>/dev/null)
+          case "$o" in *err-中文*) ok "sess stderr 并到 stdout" ;; *) bad "sess stderr 并到 stdout：[$o]" ;; esac
+          case "$o" in *out-ok*) ok "sess 失败不影响正常输出" ;; *) bad "sess 正常输出丢失：[$o]" ;; esac
+
+          # 8) list / stop
+          "$PY" "$SESS_WIN" list | grep -q "$H" && ok "sess list" || bad "sess list 没列出 $H"
+          "$PY" "$SESS_WIN" stop "$H" >/dev/null
+          eq "sess stop rc" "0" "$?"
+          o=$("$PY" "$SESS_WIN" list)
+          case "$o" in *"$H"*) bad "sess stop 后仍有残留：$o" ;; *) ok "sess stop 后无残留" ;; esac
+
+          echo "---- 失败数: $fails ----"
+          [ "$fails" -eq 0 ]

@@ -15,10 +15,16 @@
 协议：本地 keeper（后台进程）持有 `ssh -T`，远端 loop 从 stdin 按行读
 `<token>:<base64 脚本>`，执行后在输出末尾写 `\\n__END__<token>:<退出码>\\n`。
 脚本一律 base64，远端本地都不做引号解析；输出的分帧全靠随机 token 哨兵。
+
+哨兵数量按远端类型分：
+  * posix  —— stdout/stderr 各一份（两条真管道，到达顺序不定，靠双哨兵对齐）；
+  * windows—— 只有 stdout 一份。Windows sshd 把 stderr 压到远端进程退出才交给
+    客户端，常驻会话永不退出 ⇒ stderr 哨兵永远到不了。远端的 PWSH_LOOP 已经把
+    错误流并进 stdout（`[Console]::SetError([Console]::Out)` + `2>&1`），代价是
+    **Windows 目标上 sess 的 stderr 会出现在 stdout 里**（分不开）。
 """
 import base64
 import errno
-import fcntl
 import io
 import os
 import signal
@@ -28,6 +34,11 @@ import subprocess
 import sys
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:      # Windows 的 CPython 没有 fcntl（Git Bash 里跑 POSIX sess 会走到这里）
+    fcntl = None
 
 HOME = os.path.expanduser("~")
 CACHE = os.path.join(HOME, ".cache", "sess")
@@ -50,11 +61,19 @@ POSIX_LOOP = (
 PWSH_LOOP = r'''
 $ProgressPreference = "SilentlyContinue"
 try { $PSStyle.OutputRendering = "PlainText" } catch {}
+# Windows 的默认输出码页是 437/936，中文会被编成 '?'；pwsh 7 重定向到管道时也一样
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
+# Windows sshd 只在远端进程退出时才把 stderr 交给客户端 —— 常驻会话永不退出，
+# 所以 stderr 哨兵永远到不了。这里把错误流并进 stdout，只发一路（见 Keeper.reset）。
+try { [Console]::SetError([Console]::Out) } catch {}
 [Console]::Out.WriteLine("__READY__")
 [Console]::Out.Flush()
 while ($true) {
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
+    # Windows PowerShell 5.1 写管道时会在流首带 UTF-8 BOM：按控制台码页解码后
+    # 变成若干非十六进制字符粘在 token 前面（实测 CP437 下是 ∩╗┐），统一剥掉。
+    $line = [regex]::Replace($line, '^[^0-9A-Fa-f]+', '')
     if ($line.Length -eq 0) { continue }
     $i = $line.IndexOf(":")
     $tok = $line.Substring(0, $i)
@@ -68,7 +87,8 @@ while ($true) {
         # 关键：$? 必须在「用户代码之后、同一 scriptblock 内」取值，
         # 否则点源返回后 $? 只反映 dot-source 本身（恒为 True）。
         $src = $src + "`n" + '$global:__sessOk = $?; $global:__sessCode = $LASTEXITCODE'
-        . ([scriptblock]::Create($src))
+        # 2>&1 把错误流并进成功流：stderr 在会话里送不出去（见文件头说明）
+        . ([scriptblock]::Create($src)) 2>&1
         if (-not $global:__sessOk) {
             if ($global:__sessCode -is [int] -and $global:__sessCode -ne 0) { $code = $global:__sessCode } else { $code = 1 }
         }
@@ -76,11 +96,9 @@ while ($true) {
         [Console]::Error.WriteLine($_.ToString())
         $code = 1
     }
+    # 只写 stdout 一份哨兵：stderr 在这条链路上根本到不了客户端
     [Console]::Out.Write("`n__END__" + $tok + ":" + $code + "`n")
     [Console]::Out.Flush()
-    # stderr 也要发一份哨兵：两条管道到达顺序不确定，keeper 靠双哨兵对齐
-    [Console]::Error.Write("`n__END__" + $tok + ":" + $code + "`n")
-    [Console]::Error.Flush()
 }
 '''
 
@@ -251,7 +269,10 @@ class Keeper:
     def reset(self):
         with self.buflock:
             self.bufs = {"out": b"", "err": b""}
-            self.pending = {"out", "err"}
+            # posix：远端 stdout/stderr 是真两路，靠双哨兵对齐到达顺序。
+            # windows：Windows sshd 把 stderr 压到远端进程退出才交给客户端（常驻
+            # 会话永不退出 ⇒ 永远收不到），远端已把错误流并进 stdout，只等 out。
+            self.pending = {"out", "err"} if self.kind == "posix" else {"out"}
             self.out_done = False
             self.rc = 0
 
@@ -333,6 +354,7 @@ class Keeper:
                 send_frame(conn, b"R", struct.pack(">i", 1))
                 return
             code = 1
+            desync = False
             while True:
                 if self.out_done:
                     # stdout 已收哨兵、stderr 还没到：给 stderr 一点宽限（用户代码
@@ -340,6 +362,17 @@ class Keeper:
                     try:
                         kind, data = q.get(timeout=0.3)
                     except Exception:
+                        # 宽限用尽：用 stdout 哨兵里的真实 rc（别用初始值 1），
+                        # 但这个会话已经错位（stderr 里可能有残留），标记为死，
+                        # 下一条命令重建，避免串味。
+                        code = self.rc
+                        desync = True
+                        self.dead = True
+                        self.log("stderr sentinel missing -> respawn")
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
                         break
                 else:
                     kind, data = q.get()
@@ -360,6 +393,8 @@ class Keeper:
                     return
             self.q = None
             self.last_used = time.time()
+            if desync:
+                self.log("cmd done rc=%d (desync, session will respawn)" % code)
             try:
                 send_frame(conn, b"R", struct.pack(">i", code))
             except OSError:
@@ -378,13 +413,43 @@ class Keeper:
             pass
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv = srv
-        srv.bind(sock_path)
+        # 关键顺序：**先 spawn 远端会话，就绪后才 bind/发布 socket**。
+        # 以前先 bind 再 spawn，客户端会抢在 spawn 完成前连上（连接进 backlog），
+        # 把命令塞进还没开始读 stdin 的 ssh，拿到空输出/假退出码。
+        try:
+            self.spawn()
+        except Exception as e:
+            self.log("spawn failed: %r" % e)
+            try:
+                srv.close()
+            except Exception:
+                pass
+            for p in (sock_path, pid_file, os.path.join(CACHE, self.host + ".sig")):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            return
+        try:
+            srv.bind(sock_path)
+        except OSError as e:
+            # 另一个 keeper 抢先绑定了同一个路径：让位（别删它的 socket/pid）
+            self.log("bind failed: %r -> exit" % e)
+            try:
+                srv.close()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            return
         os.chmod(sock_path, 0o600)
         srv.listen(8)
         # 1s 轮询：Linux 上「别的线程 close 监听 socket」不会唤醒阻塞中的 accept()，
         # 所以靠短超时来感知 stop / 空闲，不能等 30s
         srv.settimeout(0.25)
-        with open(paths(self.host)[1], "w") as f:
+        with open(pid_file, "w") as f:
             f.write(str(os.getpid()))
         try:
             with open(os.path.join(CACHE, self.host + ".sig"), "w") as f:
@@ -392,11 +457,6 @@ class Keeper:
         except OSError:
             pass
         self.log("keeper up kind=%s" % self.kind)
-        try:
-            self.spawn()
-        except Exception as e:
-            self.log("spawn failed: %r" % e)
-            raise
         while not self.kill_now:
             try:
                 conn, _ = srv.accept()
@@ -464,15 +524,59 @@ class Keeper:
                 pass
 
 
+def pid_alive(pid):
+    """只探测存活，绝不改变进程状态。
+
+    Windows 上 **不能** 用 `os.kill(pid, 0)`：CPython 在 Windows 上把非
+    CTRL_* 的信号一律翻译成 TerminateProcess —— 传 0 会直接把 keeper 杀掉。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(h)
+            return bool(ok) and code.value == 259          # STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def kill_pid(pid):
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        try:
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if h:
+                ctypes.windll.kernel32.TerminateProcess(h, 1)
+                ctypes.windll.kernel32.CloseHandle(h)
+        except Exception:
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def live_keeper(sock_path, pid_file):
     """pid 文件指向的进程活着、并且它的 socket 真的能连上。"""
     try:
         pid = int(open(pid_file).read().strip())
     except (OSError, ValueError):
         return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not pid_alive(pid):
         return False
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -501,34 +605,67 @@ class _Queue:
 
 # ---------------------------------------------------------------- 客户端
 
+def _lock_file(f):
+    """进程间互斥锁。POSIX 用 flock；Windows（没有 fcntl）用 msvcrt.locking。"""
+    if fcntl is not None:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        return
+    import msvcrt
+    while True:
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+            return
+        except OSError:
+            # LK_LOCK 自己只等 10s，超时抛 OSError；这里继续等
+            time.sleep(0.05)
+
+
+def _unlock_file(f):
+    try:
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        else:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
 def spawn_keeper(host, verbose=False):
-    """加锁起 keeper：多客户端同时首连时只起一个。返回已连上的 socket 或 None。"""
+    """加锁起 keeper：多客户端同时首连时只起一个。
+
+    返回 (已连上的 socket 或 None, keeper 的 Popen 或 None)：
+    - socket 非 None = 别人已经起好了，直接用；
+    - Popen 非 None = 本次拉起了 keeper，调用方负责等它发布 socket
+      （socket 只有在远端会话就绪后才出现）并感知它提前退出。
+    """
     sock_path = paths(host)[0]
     lock_path = os.path.join(CACHE, host + ".lock")
     try:
         lf = open(lock_path, "a+")
     except OSError:
-        return None
+        return None, None
     try:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        _lock_file(lf)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             s.connect(sock_path)
-            return s              # 别人已经起好了
+            return s, None              # 别人已经起好了
         except OSError:
             s.close()
         kind = detect_kind(host)
         if verbose:
             sys.stderr.write("sess: 启动会话 %s (%s)\n" % (host, kind))
-        subprocess.Popen([sys.executable, os.path.abspath(__file__),
-                          "__keeper", host, kind],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True,
-                         close_fds=True)
-        return None
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                                 "__keeper", host, kind],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                close_fds=True)
+        return None, proc
     finally:
         try:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            _unlock_file(lf)
             lf.close()
         except OSError:
             pass
@@ -554,7 +691,12 @@ def connect(host, autostart=True, verbose=False):
             sys.stderr.write("sess: %s 的会话是旧代码，重建\n" % host)
         cmd_stop(host, quiet=True)
         wait_gone(host)
-    for attempt in range(200 if autostart else 1):
+    # socket 只在远端会话就绪后才发布，所以首连要一直重试到超时。
+    # keeper 若提前退出（ssh 拉不起来 / 抢绑失败），立刻收手，不空等。
+    deadline = None
+    proc = None
+    attempt = 0
+    while True:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             s.connect(sock_path)
@@ -564,11 +706,19 @@ def connect(host, autostart=True, verbose=False):
             if not autostart:
                 return None
             if attempt == 0:
-                s = spawn_keeper(host, verbose)
+                s, proc = spawn_keeper(host, verbose)
                 if s is not None:
                     return s
+                # 从拉起 keeper 那一刻开始计时（detect_kind 可能已经花掉不少时间）
+                deadline = time.time() + READY_TIMEOUT + 15
+            elif proc is not None and proc.poll() is not None:
+                if verbose:
+                    sys.stderr.write("sess: keeper 进程已退出（%s）\n" % host)
+                return None
+            if deadline is not None and time.time() >= deadline:
+                return None
             time.sleep(0.1)
-    return None
+            attempt += 1
 
 
 PROBE_DEADLINE = 1.5
@@ -680,13 +830,9 @@ def hard_stop(host):
     except (OSError, ValueError):
         pid = 0
     if pid:
-        for sig in (signal.SIGKILL,):
-            try:
-                os.kill(pid, sig)
-            except OSError:
-                pass
+        kill_pid(pid)
         for _ in range(50):
-            if not os.path.exists("/proc/%d" % pid):
+            if not pid_alive(pid):
                 break
             time.sleep(0.02)
     for f in (sock_path, pid_file):
@@ -729,7 +875,10 @@ def cmd_list():
     for h in sorted(hs):
         sock_path, pid_file, kind_file, _ = paths(h)
         pid = open(pid_file).read().strip()
-        alive = os.path.exists("/proc/" + pid)
+        try:
+            alive = pid_alive(int(pid))
+        except ValueError:
+            alive = False
         kind = open(kind_file).read().strip() if os.path.exists(kind_file) else "?"
         print("%-16s %-8s pid=%-7s %s" % (h, kind, pid, "运行中" if alive else "已死（残留文件）"))
     return 0
@@ -747,6 +896,13 @@ def cmd_kind(host, reset=False):
 
 
 def main(argv):
+    # Windows 的 Python 在管道上按系统码页（cp437/cp936）编码文本；诊断信息是
+    # 中文，不转 UTF-8 会 UnicodeEncodeError。POSIX 上这样设置也无害。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ensure_cache()
     args = argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
