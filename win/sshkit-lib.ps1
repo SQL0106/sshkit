@@ -309,20 +309,28 @@ function Start-ShkSessKeeper {
     $exe = Get-ShkPowerShellExe
     $a = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $sess,
            '__keeper', $HostName, $Kind, (ConvertTo-ShkB64 $remote))
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    # 必须重定向：否则 keeper 继承调用方的 stdout/stderr 句柄，`rsh ... | tail`
-    # 这类管道会因为 keeper 还活着而永远等不到 EOF。keeper 自己只写日志文件。
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    if ($null -ne $psi.PSObject.Properties['ArgumentList']) {
-        foreach ($x in $a) { $psi.ArgumentList.Add($x) }
+    # 拉起方式按平台分开，两边堵的坑正好相反：
+    #   Windows：System.Diagnostics.Process 会 bInheritHandles=TRUE，keeper 继承
+    #     调用方 stdout 管道写端 → 父进程永远等不到 EOF（实测子进程已 exit 仍挂住）。
+    #     改用 Start-Process（ShellExecute，不继承句柄；-WindowStyle Hidden 不弹窗）。
+    #   POSIX：Start-Process 直接 fork/exec 会继承 fd，同样挂住管道；必须用
+    #     Process + RedirectStandardOutput/Error（.NET 给子进程新管道，天然 CLOEXEC）。
+    if (Test-ShkWindows) {
+        $argStr = (($a | ForEach-Object { ConvertTo-ShkArg $_ }) -join ' ')
+        Start-Process -FilePath $exe -ArgumentList $argStr -WindowStyle Hidden | Out-Null
     } else {
-        $psi.Arguments = (($a | ForEach-Object { ConvertTo-ShkArg $_ }) -join ' ')
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        if ($null -ne $psi.PSObject.Properties['ArgumentList']) {
+            foreach ($x in $a) { $psi.ArgumentList.Add($x) }
+        } else {
+            $psi.Arguments = (($a | ForEach-Object { ConvertTo-ShkArg $_ }) -join ' ')
+        }
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
     }
-    [System.Diagnostics.Process]::Start($psi) | Out-Null
     Trace-ShkSess 'keeper spawned'
     # 指纹由拉起方写：keeper 只负责跑协议，源码变更检测归客户端
     try { Set-Content -LiteralPath (Get-ShkSessPaths $HostName).Sig -Value (Get-ShkSessSig) -Encoding ascii } catch { }
