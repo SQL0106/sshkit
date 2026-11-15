@@ -236,8 +236,8 @@ jobs:
           # 跨解释器：cmd 与 PS 5.1
           $o = & pwsh -NoProfile -File $wsh --direct --shell cmd localhost 'echo cmd-ok'
           Assert-Contains 'wsh --shell cmd' 'cmd-ok' $o
-          $o = & pwsh -NoProfile -File $wsh --direct --shell ps5 localhost '5.1-major=$($PSVersionTable.PSVersion.Major)'
-          Assert-Contains 'wsh --shell ps5' '5.1-major=5' $o
+          $o = & pwsh -NoProfile -File $wsh --direct --shell ps5 localhost "'ps5-major=' + `$PSVersionTable.PSVersion.Major"
+          Assert-Contains 'wsh --shell ps5' 'ps5-major=5' $o
 
           # -f：多行脚本 + 函数 + 中文 + 退出码
           $f = Join-Path $env:RUNNER_TEMP 't.ps1'
