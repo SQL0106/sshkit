@@ -152,6 +152,25 @@ ssh -T android-host "/data/local/Droidspaces/bin/droidspaces -n 'debian-13' run 
 - **端口共存**：容器网络若是 `net_mode=host`（与 Android 共享 netns），容器 sshd 和 Android 的 sshd 不能抢同一个端口。常见布局是 Android 用 8022、容器用 22（反过来也行，给容器 2222 再配别名）。若某台机 Android 的 ssh 已经占了 22，容器 sshd 会起不来 —— 此时要么改容器 sshd 端口，要么用 `rshc` 包装（完全不依赖 22）。
 - **容器自启**：容器里的 sshd 是它自己的 systemd 服务（`ssh.service`），容器不启动就没有 22 端口。要让手机重启后仍能直连，把该容器 `container.config` 的 `run_at_boot` 设为 `1`（droidspaces 的 Magisk 服务会在开机且网络就绪后自动启动这些容器；日志在 `/data/local/Droidspaces/Logs/boot-module.log`）。改前先备份该文件。
 
+#### 容器里的账号：用户态与 root 分开两条入口
+
+容器里同时有普通用户和 root 时，**不要用一个别名兼顾两种身份**。给同一台机配两个别名，按「要干什么」选，而不是按「能不能连上」选：
+
+| 别名（示例） | 登入账号 | 用途 |
+|---|---|---|
+| `ctr-host`（容器自己的 sshd，如 :22） | 普通用户（如 `SQL916`，`HOME=/home/<user>`） | 日常：写代码、装用户态工具、跑 agent |
+| `ctr-host-root`（同一 IP/端口，`User root`） | `root` | 系统级：apt/dnf、`systemctl`、写 `/etc`、`/root` |
+| `android-host`（宿主 shell，如 :8022） | `root`（Android 侧通常只有 root） | 宿主：`droidspaces`、KernelSU、Android 自身配置 |
+
+要点：
+
+- **普通用户通常没有免密 sudo**。系统级操作直接走 `ctr-host-root`（root 登录），不要靠 `sudo`；`rsh -s` 在这种环境下会因 sudoers 未授权而失败。
+- **无密码登录依赖按账号的 `~/.ssh/authorized_keys`**，不是密码：容器里每个账号各有一份（`/home/<user>/.ssh/authorized_keys`、`/root/.ssh/authorized_keys`）。只配了 root 的那份时，普通用户别名会 `Permission denied (publickey)` —— 这是钥匙没装到该账号，不是 sshkit 的问题。
+- **`rsh -C host` 的包装模式是宿主 root 执行 `droidspaces run`**，进容器后天然是 root，与「容器 sshd 用普通用户登录」不是一回事。要用户态就直连 `ctr-host`；要 root 又不想多配别名才用 `-C`（或 `rsh -c <容器名>`）。
+- **文档/脚本里不放私钥、口令、真实地址**：别名只留在本机 `~/.ssh/config`，仓库示例统一用 `linux-host` / `android-host` / `ctr-host`。
+
+**跨机回连（容器 → 宿主）用 IPv6 别名时会漂移**：手机的公网 v6 是运营商动态分配的，**会变**。以宿主上 `ip -6 addr show scope global` 的实测值为准，改完要**三端同步**（宿主 `~/.ssh/config`、容器里的 `server-v6` 别名、本机/其他跳板的 `server-v6`）——只改一处就会出现「昨天还能连、今天 timeout」。验证只看结果：`ssh -o BatchMode=yes server-v6 hostname` 返回预期主机名才算通；连容器→宿主时用普通用户名（`<user>@`），`root@` 可能被 `authorized_keys`/`PermitRootLogin` 拒绝。
+
 ## wsh
 
 前提：远端 OpenSSH Server 的默认 shell 可以是 **pwsh 7 / Windows PowerShell 5.1 / cmd.exe** 中的任意一种（注册表 `DefaultShell` 设置）。`wsh` 首次连接时自动探测并缓存，也可以显式切换解释器。
